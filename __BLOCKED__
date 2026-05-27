@@ -1,0 +1,5 @@
+$sig = '[DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, uint dwFlags);'
+$type = Add-Type -MemberDefinition $sig -Name 'K32' -Namespace 'W' -PassThru
+$path = '\\?\C:\0\ruoo\ruoo-arsenal\plugins\ruoo_recon_v5.dll'
+$ok = $type::MoveFileEx($path, $null, 4)
+if($ok) { Write-Host '[+] 已标记重启删除' } else { Write-Host '[!] 失败' }

@@ -1,0 +1,25 @@
+# RUOO-CONSOLE — AI 协助规则
+# 
+# 此文件被 Cursor / Copilot / Claude Code / Aider 等工具自动识别
+
+## 项目身份
+- 项目名: ruoo-console v4.1
+- 类型: Rust TUI 终端面板
+- 代码位置: C:\0\ruoo\ruoo-arsenal\
+
+## 核心规则 (不可违反)
+1. 所有 I/O 操作必须在后台线程执行 (spawn_async_cmd)，禁止阻塞 UI 线程
+2. 密码学必须使用纯 Rust crate (sha2/bcrypt/aes-gcm)，禁止回退到外部命令
+3. TLS 默认验证证书 (verify=true)，noverify 需显式标注
+4. 脚本沙箱权限检查 (PermissionSet) 不可绕过
+5. 危险命令黑名单 (DANGEROUS_COMMANDS) 不可移除条目
+6. 插件使用独立线程 + 30s 超时 + catch_unwind 防崩溃
+7. 所有 spawn 线程必须包裹 catch_unwind
+8. 错误类型统一使用 Result<T, String>，不引入 thiserror/anyhow
+
+## 参考文档
+- PLUGIN_DEV_GUIDE.md — 插件/驱动开发规范
+
+## 构建
+- cargo check (快速验证)
+- cargo build --release (完整构建)
