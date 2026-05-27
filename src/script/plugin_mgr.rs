@@ -536,10 +536,10 @@ impl PluginManager {
                 let _ = handle.join();
             }
 
-            // 调用清理函数
+            // 调用清理函数 (v6.7 fix: catch_unwind 防止 shutdown 崩溃炸进程)
             unsafe {
                 if let Ok(shutdown) = info.lib.get::<unsafe extern "C" fn()>(b"ruoo_plugin_shutdown") {
-                    shutdown();
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shutdown()));
                 }
             }
             drop(info);
@@ -837,21 +837,35 @@ impl PluginManager {
         let result = guard.call_with_timeout(
             move || -> Result<String, String> {
                 unsafe {
-                    let exec: libloading::Symbol<unsafe extern "C" fn(*const std::ffi::c_char) -> *mut std::ffi::c_char> =
-                        lib.get(b"ruoo_plugin_exec")
-                            .map_err(|e| format!("插件缺少 ruoo_plugin_exec: {}", e))?;
-                    let c_cmd = std::ffi::CString::new(cmd_owned.clone())
-                        .map_err(|e| format!("命令含空字节: {}", e))?;
-                    let ptr = exec(c_cmd.as_ptr());
-                    if ptr.is_null() {
-                        return Err("插件返回空指针".to_string());
+                    // v6.7 fix: stderr 捕获 — 防止插件输出破坏 TUI 布局
+                    let stderr_cap = super::plugin_stderr::StderrCapture::begin();
+                    let exec_result = (|| -> Result<String, String> {
+                        let exec: libloading::Symbol<unsafe extern "C" fn(*const std::ffi::c_char) -> *mut std::ffi::c_char> =
+                            lib.get(b"ruoo_plugin_exec")
+                                .map_err(|e| format!("插件缺少 ruoo_plugin_exec: {}", e))?;
+                        let c_cmd = std::ffi::CString::new(cmd_owned.clone())
+                            .map_err(|e| format!("命令含空字节: {}", e))?;
+                        let ptr = exec(c_cmd.as_ptr());
+                        if ptr.is_null() {
+                            return Err("插件返回空指针".to_string());
+                        }
+                        let result = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
+                        if let Ok(free_fn) = lib.get::<unsafe extern "C" fn(*mut std::ffi::c_char)>(b"ruoo_plugin_free_result") {
+                            free_fn(ptr);
+                        }
+                        Ok(result)
+                    })();
+                    let captured = stderr_cap.map(|c| c.end()).unwrap_or_default();
+                    match exec_result {
+                        Ok(output) => {
+                            if captured.is_empty() { Ok(output) }
+                            else { Ok(format!("{}\n[plugin stderr]\n{}", output, captured)) }
+                        }
+                        Err(e) => {
+                            if captured.is_empty() { Err(e) }
+                            else { Err(format!("{}\n[plugin stderr]\n{}", e, captured)) }
+                        }
                     }
-                    let result = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
-                    // 释放内存
-                    if let Ok(free_fn) = lib.get::<unsafe extern "C" fn(*mut std::ffi::c_char)>(b"ruoo_plugin_free_result") {
-                        free_fn(ptr);
-                    }
-                    Ok(result)
                 }
             },
             timeout_ms,
