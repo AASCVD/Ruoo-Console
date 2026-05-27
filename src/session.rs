@@ -13,7 +13,6 @@ pub struct TabSession {
     pub name: String,
     pub target: String,
     pub ai_mode: bool,
-    pub active_panel: String,
 }
 
 /// 完整会话状态
@@ -52,7 +51,6 @@ pub fn build_session(tab_mgr: &crate::tabs::TabManager) -> SessionState {
             name: tab.name.clone(),
             target: tab.target.clone(),
             ai_mode: tab.ai_mode,
-            active_panel: format!("{:?}", tab.active_panel),
         }
     }).collect();
 
@@ -65,8 +63,6 @@ pub fn build_session(tab_mgr: &crate::tabs::TabManager) -> SessionState {
 
 /// 从会话状态恢复 TabManager
 pub fn restore_tabs(session: &SessionState) -> crate::tabs::TabManager {
-    use crate::Panel;
-
     let mut mgr = crate::tabs::TabManager::new();
 
     // 清除默认标签，用保存的标签替换
@@ -75,17 +71,9 @@ pub fn restore_tabs(session: &SessionState) -> crate::tabs::TabManager {
     }
 
     for ts in &session.tabs {
-        let panel = match ts.active_panel.as_str() {
-            "Recon" => Panel::Recon,
-            "Payloads" => Panel::Payloads,
-            "Crypto" => Panel::Crypto,
-            "System" => Panel::System,
-            _ => Panel::Terminal,
-        };
         let mut tab = crate::tabs::Tab::new(ts.id, &ts.name);
         tab.target = ts.target.clone();
         tab.ai_mode = ts.ai_mode;
-        tab.active_panel = panel;
         mgr.tabs.push(tab);
     }
 
@@ -93,10 +81,6 @@ pub fn restore_tabs(session: &SessionState) -> crate::tabs::TabManager {
         mgr.active_idx = session.active_tab_idx;
     }
 
-    // 更新 next_id
-    // 通过反射无法访问私有字段，但 new_tab 会自增
-    // 简单方案: 重建时直接用 session.next_tab_id
-    // 由于 next_id 是私有的，用一个临时方案
     mgr.set_next_id(session.next_tab_id);
 
     mgr

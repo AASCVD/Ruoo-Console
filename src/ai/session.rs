@@ -34,7 +34,7 @@ impl AiSession {
                      .map(|p| p.display().to_string()).unwrap_or_else(|_| "(未知)".into()))
             })
             .unwrap_or_else(build_system_prompt);
-        let sp = crate::stealth::sanitize_message(&sp_raw);
+        let sp = sp_raw;
         let mut tools = build_tools();
         let plugin_tools = crate::plugin::all_ai_tool_json();
         tools.extend(plugin_tools);
@@ -119,7 +119,7 @@ impl AiSession {
                     }
 
                     let atc: Vec<Value> = tool_calls.iter().map(|tc| {
-                        let safe_args = crate::stealth::sanitize_message(&tc.arguments);
+                        let safe_args = tc.arguments.clone();
                         json!({
                             "id": tc.id, "type": "function",
                             "function": {"name": tc.name, "arguments": safe_args}
@@ -216,7 +216,7 @@ impl AiSession {
                         let safe_result = if is_code_tool(&tc.name) {
                             truncated
                         } else {
-                            crate::stealth::sanitize_message(&truncated)
+                            truncated
                         };
                         self.history.push(json!({"role":"tool","tool_call_id":tc.id,"content":safe_result}));
                     }

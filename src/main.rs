@@ -1,5 +1,5 @@
 // ============================================================
-// RUOO-ARSENAL v4.2 — 终端面板
+// RUOO-CONSOLE v4.1.0 — 终端面板
 // 模块化架构: main / ui / commands / utils / theme / tools / ai / config / script
 // ============================================================
 #![allow(dead_code)]
@@ -11,7 +11,6 @@ mod commands;
 mod ui;
 mod config;
 mod ai;
-mod stealth;
 mod script;
 mod vault;
 mod auth;
@@ -27,7 +26,7 @@ mod clipboard;
 mod shortcuts;
 mod session;
 mod window;
-mod secure_channel;
+mod crypto_channel;
 mod panic_guard;
 mod telemetry;
 
@@ -166,42 +165,6 @@ pub struct ProgressState {
     pub message: String,
 }
 
-// ── 面板 ──
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Panel {
-    Terminal,
-    Recon,
-    Payloads,
-    Crypto,
-    System,
-}
-
-impl Panel {
-    #[allow(dead_code)]
-    fn all() -> [Panel; 5] {
-        [Panel::Terminal, Panel::Recon, Panel::Payloads, Panel::Crypto, Panel::System]
-    }
-    #[allow(dead_code)]
-    fn label(&self) -> &str {
-        match self {
-            Panel::Terminal => "F1终端",
-            Panel::Recon    => "F2侦察",
-            Panel::Payloads => "F3载荷",
-            Panel::Crypto   => "F4密码",
-            Panel::System   => "F5系统",
-        }
-    }
-    fn name(&self) -> &str {
-        match self {
-            Panel::Terminal => "终端",
-            Panel::Recon    => "侦察",
-            Panel::Payloads => "载荷",
-            Panel::Crypto   => "密码",
-            Panel::System   => "系统",
-        }
-    }
-}
-
 // ── 右侧信息侧边栏显示模式 ──
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RightSidebarMode {
@@ -271,7 +234,6 @@ pub struct App {
     pub scroll_offset: usize,
     pub auto_scroll: bool,
     pub scroll_max: usize,
-    pub active_panel: Panel,
     pub show_sidebar: bool,
     /// v14.x: 左侧栏工具模块和快捷命令的独立滚动偏移
     pub sidebar_tool_scroll: usize,
@@ -415,7 +377,6 @@ impl App {
             scroll_offset: 0,
             auto_scroll: true,
             scroll_max: 0,
-            active_panel: Panel::Terminal,
             show_sidebar: sidebar,
             sidebar_tool_scroll: 0,
             sidebar_quick_scroll: 0,
@@ -555,10 +516,6 @@ impl App {
     fn reset_scroll(&mut self) {
         self.auto_scroll = true;
         // scroll_offset 由下一帧 render_output 自动追底 (auto_scroll=true 时强制 max_scroll)
-    }
-    fn switch_panel(&mut self, panel: Panel) {
-        self.active_panel = panel;
-        self.push_output(&format!("[+] 面板: {} | 工具: F6左栏 | 信息: F10右栏", panel.name()));
     }
 }
 
@@ -772,7 +729,7 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
                 app.push_output("[+] 终端已清空 (Ctrl+L)");
                 // v4.7: 同步清理到当前标签
                 app.tab_mgr.save_active(&app.output, app.scroll_offset, app.scroll_max,
-                    app.auto_scroll, &app.target, app.ai_mode, app.active_panel);
+                    app.auto_scroll, &app.target, app.ai_mode);
             }
             // v4.5.1: 键盘调节字体 (Alt+滚轮也可)
             KeyCode::Char('=') => {
@@ -810,13 +767,13 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
             KeyCode::Char('w') | KeyCode::Char('W') => {
                 // Ctrl+W: 关闭当前标签页 (保存当前状态)
                 app.tab_mgr.save_active(&app.output, app.scroll_offset, app.scroll_max,
-                    app.auto_scroll, &app.target, app.ai_mode, app.active_panel);
+                    app.auto_scroll, &app.target, app.ai_mode);
                 let name = app.tab_mgr.active().name.clone();
                 if app.tab_mgr.close_current() {
                     app.tab_mgr.restore_active_to(
                         &mut app.output, &mut app.scroll_offset, &mut app.scroll_max,
                         &mut app.auto_scroll, &mut app.target, &mut app.ai_mode,
-                        &mut app.active_panel,
+                        
                     );
                     app.push_output(&format!("[+] 标签已关闭: {} | 当前: {}",
                         name, app.tab_mgr.active().name));
@@ -827,12 +784,12 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 // Ctrl+T: 新建标签页 (保存当前状态，开新标签)
                 app.tab_mgr.save_active(&app.output, app.scroll_offset, app.scroll_max,
-                    app.auto_scroll, &app.target, app.ai_mode, app.active_panel);
+                    app.auto_scroll, &app.target, app.ai_mode);
                 app.tab_mgr.new_tab(None);
                 app.tab_mgr.restore_active_to(
                     &mut app.output, &mut app.scroll_offset, &mut app.scroll_max,
                     &mut app.auto_scroll, &mut app.target, &mut app.ai_mode,
-                    &mut app.active_panel,
+                    
                 );
                 app.push_output(&format!("[+] 新建标签: {}", app.tab_mgr.active().name));
             }
@@ -853,45 +810,45 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
             // 注意: Ctrl+Tab 在某些终端会被拦截, 推荐用 Ctrl+PageDown/Up
             KeyCode::Tab => {
                 app.tab_mgr.save_active(&app.output, app.scroll_offset, app.scroll_max,
-                    app.auto_scroll, &app.target, app.ai_mode, app.active_panel);
+                    app.auto_scroll, &app.target, app.ai_mode);
                 app.tab_mgr.next_tab();
                 app.tab_mgr.restore_active_to(
                     &mut app.output, &mut app.scroll_offset, &mut app.scroll_max,
                     &mut app.auto_scroll, &mut app.target, &mut app.ai_mode,
-                    &mut app.active_panel,
+                    
                 );
                 app.push_output(&format!("[+] 切换到: {}", app.tab_mgr.active().name));
             }
             KeyCode::BackTab => {
                 app.tab_mgr.save_active(&app.output, app.scroll_offset, app.scroll_max,
-                    app.auto_scroll, &app.target, app.ai_mode, app.active_panel);
+                    app.auto_scroll, &app.target, app.ai_mode);
                 app.tab_mgr.prev_tab();
                 app.tab_mgr.restore_active_to(
                     &mut app.output, &mut app.scroll_offset, &mut app.scroll_max,
                     &mut app.auto_scroll, &mut app.target, &mut app.ai_mode,
-                    &mut app.active_panel,
+                    
                 );
                 app.push_output(&format!("[+] 切换到: {}", app.tab_mgr.active().name));
             }
             KeyCode::PageDown => {
                 app.tab_mgr.save_active(&app.output, app.scroll_offset, app.scroll_max,
-                    app.auto_scroll, &app.target, app.ai_mode, app.active_panel);
+                    app.auto_scroll, &app.target, app.ai_mode);
                 app.tab_mgr.next_tab();
                 app.tab_mgr.restore_active_to(
                     &mut app.output, &mut app.scroll_offset, &mut app.scroll_max,
                     &mut app.auto_scroll, &mut app.target, &mut app.ai_mode,
-                    &mut app.active_panel,
+                    
                 );
                 app.push_output(&format!("[+] 切换到: {}", app.tab_mgr.active().name));
             }
             KeyCode::PageUp => {
                 app.tab_mgr.save_active(&app.output, app.scroll_offset, app.scroll_max,
-                    app.auto_scroll, &app.target, app.ai_mode, app.active_panel);
+                    app.auto_scroll, &app.target, app.ai_mode);
                 app.tab_mgr.prev_tab();
                 app.tab_mgr.restore_active_to(
                     &mut app.output, &mut app.scroll_offset, &mut app.scroll_max,
                     &mut app.auto_scroll, &mut app.target, &mut app.ai_mode,
-                    &mut app.active_panel,
+                    
                 );
                 app.push_output(&format!("[+] 切换到: {}", app.tab_mgr.active().name));
             }
@@ -1165,11 +1122,6 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
                 app.running = false;
             }
         }
-        KeyCode::F(1) => app.switch_panel(Panel::Terminal),
-        KeyCode::F(2) => app.switch_panel(Panel::Recon),
-        KeyCode::F(3) => app.switch_panel(Panel::Payloads),
-        KeyCode::F(4) => app.switch_panel(Panel::Crypto),
-        KeyCode::F(5) => app.switch_panel(Panel::System),
         KeyCode::F(6) => {
             // 左侧栏已移除
         }
@@ -1798,12 +1750,7 @@ fn main() -> io::Result<()> {
     // ═══ 防崩溃系统 — 必须在任何操作之前安装 ═══
     install_crash_defense();
     
-    // ★ AV指纹对抗: 每次构建注入不同种子, 确保二进制hash唯一
-    // 引用 stealth::BUILD_SEED 防止 LTO 优化消除
-    let _av_seed = crate::stealth::BUILD_SEED;
-    if _av_seed == 0 {
-        eprintln!("BUILD_SEED=0");
-    }
+
 
 
     // Windows: 设置控制台为 UTF-8，解决中文乱码
@@ -2320,7 +2267,7 @@ fn main() -> io::Result<()> {
 
     // v4.7: 保存会话标签页状态
     app.tab_mgr.save_active(&app.output, app.scroll_offset, app.scroll_max,
-        app.auto_scroll, &app.target, app.ai_mode, app.active_panel);
+        app.auto_scroll, &app.target, app.ai_mode);
     let session_state = session::build_session(&app.tab_mgr);
     if let Err(e) = session_state.save() {
         eprintln!("[!] 会话保存失败: {}", e);

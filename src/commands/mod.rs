@@ -370,7 +370,6 @@ pub fn process_cmd(app: &mut App, raw: &str) {
             app.push_output(&format!("  架构       : {}", std::env::consts::ARCH));
             app.push_output(&format!("  核心数     : {}", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)));
             app.push_output(&format!("  工作目录   : {}", std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "(未知)".into())));
-            app.push_output(&format!("  面板       : {:?}", app.active_panel));
             app.push_output(&format!("  输出行数   : {}", app.output.len()));
             app.push_output(&format!("  历史命令   : {}", app.cmd_history.len()));
             app.push_output(&format!("  时间       : {}", Local::now().format("%Y-%m-%d %H:%M:%S")));

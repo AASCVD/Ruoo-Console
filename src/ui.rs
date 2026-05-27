@@ -1,5 +1,5 @@
 // ============================================================
-// RUOO-ARSENAL — UI 渲染 (v4.0 — 软件光标闪烁)
+// RUOO-ARSENAL — UI 渲染 (v4.1.0 — 软件光标闪烁)
 // ============================================================
 
 use chrono::Local;
@@ -324,11 +324,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
 
     // ── 标题栏 ──
     let now = Local::now();
-    let panel_tag = if !has_tabs {
-        format!(" [{}]", app.active_panel.name())
-    } else {
-        String::new()
-    };
+    let panel_tag = String::new();
     let ai_tag = if app.ai_mode {
         if app.is_admin {
             Span::styled(" | root#dp", Style::default()
@@ -343,7 +339,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     };
     let title = Line::from(vec![
         Span::styled("RUOO-ARSENAL", Style::default().fg(theme::CYBER).add_modifier(Modifier::BOLD)),
-        Span::styled(" v13.0", Style::default().fg(theme::MUTED)),
+        Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(theme::MUTED)),
         Span::styled(" |", Style::default().fg(theme::MUTED)),
         Span::styled(panel_tag, Style::default().fg(theme::ACCENT)),
         Span::styled("|", Style::default().fg(theme::MUTED)),
@@ -357,12 +353,9 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
     if has_tabs {
         let tab_lines = crate::tabs::render_tab_bar(&app.tab_mgr);
 
-        // 面板指示器附加到Tab栏右侧
-        let panel_tag = format!(" [{}]", app.active_panel.name());
-        let mut spans: Vec<Span> = tab_lines.into_iter()
+        let spans: Vec<Span> = tab_lines.into_iter()
             .flat_map(|l| l.spans)
             .collect();
-        spans.push(Span::styled(panel_tag, Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)));
 
         frame.render_widget(
             Paragraph::new(Line::from(spans))
@@ -428,9 +421,9 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         let out_total = app.output.len();
         let at_bottom = app.auto_scroll;
         let scroll_info = if at_bottom {
-            format!(" 行:{} v13.0 ↓底", out_total)
+            format!(" 行:{} v{} ↓底", out_total, env!("CARGO_PKG_VERSION"))
         } else {
-            format!(" 行:{} v13.0 ↑浏览", out_total)
+            format!(" 行:{} v{} ↑浏览", out_total, env!("CARGO_PKG_VERSION"))
         };
         let ai_status = if app.ai_pending {
             // 心跳动画 + 工具指示
@@ -525,7 +518,7 @@ fn render_help_page(frame: &mut Frame, app: &mut App, area: Rect) {
     // ── 标题栏 ──
     let title = Line::from(vec![
         Span::styled("RUOO-ARSENAL", Style::default().fg(theme::CYBER).add_modifier(Modifier::BOLD)),
-        Span::styled(" v5.0", Style::default().fg(theme::MUTED)),
+        Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(theme::MUTED)),
         Span::styled(" | ", Style::default().fg(theme::MUTED)),
         Span::styled("帮助页面", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled(" | ", Style::default().fg(theme::MUTED)),
@@ -1473,10 +1466,7 @@ fn render_right_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
 
             // ═══ 会话统计 ═══
             sys_lines.push(Line::from(Span::styled("═══ 会话统计 ═══", Style::default().fg(theme::CYBER).add_modifier(Modifier::BOLD))));
-            sys_lines.push(Line::from(vec![
-                Span::styled("面板 ", Style::default().fg(theme::MUTED)),
-                Span::styled(app.active_panel.name(), Style::default().fg(theme::ACCENT)),
-            ]));
+
             sys_lines.push(Line::from(vec![
                 Span::styled("输出 ", Style::default().fg(theme::MUTED)),
                 Span::styled(format!("{}行", app.output.len()), Style::default().fg(theme::ACCENT)),

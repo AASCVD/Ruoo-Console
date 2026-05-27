@@ -3,8 +3,6 @@
 // 每个标签独立输出缓冲/滚动/目标/面板状态
 // ============================================================
 
-use crate::Panel;
-
 /// 单个标签页状态
 #[derive(Clone)]
 pub struct Tab {
@@ -16,7 +14,6 @@ pub struct Tab {
     pub auto_scroll: bool,
     pub target: String,
     pub ai_mode: bool,
-    pub active_panel: Panel,
 }
 
 impl Tab {
@@ -30,7 +27,6 @@ impl Tab {
             auto_scroll: true,
             target: String::from("—"),
             ai_mode: false,
-            active_panel: Panel::Terminal,
         }
     }
 
@@ -165,7 +161,7 @@ impl TabManager {
 
     /// 同步 App 状态到当前活跃标签 (保存当前状态)
     pub fn save_active(&mut self, output: &[String], scroll_offset: usize, scroll_max: usize,
-                       auto_scroll: bool, target: &str, ai_mode: bool, active_panel: crate::Panel) {
+                       auto_scroll: bool, target: &str, ai_mode: bool) {
         let tab = &mut self.tabs[self.active_idx];
         tab.output = output.to_vec();
         tab.scroll_offset = scroll_offset;
@@ -173,14 +169,12 @@ impl TabManager {
         tab.auto_scroll = auto_scroll;
         tab.target = target.to_string();
         tab.ai_mode = ai_mode;
-        tab.active_panel = active_panel;
     }
 
     /// 同步当前标签状态到 App (恢复标签状态) — 直接写入App字段
     pub fn restore_active_to(&self, output: &mut Vec<String>, scroll_offset: &mut usize,
                               scroll_max: &mut usize, auto_scroll: &mut bool,
-                              target: &mut String, ai_mode: &mut bool,
-                              active_panel: &mut crate::Panel) {
+                              target: &mut String, ai_mode: &mut bool) {
         let tab = &self.tabs[self.active_idx];
         *output = tab.output.clone();
         *scroll_offset = tab.scroll_offset;
@@ -188,7 +182,6 @@ impl TabManager {
         *auto_scroll = tab.auto_scroll;
         *target = tab.target.clone();
         *ai_mode = tab.ai_mode;
-        *active_panel = tab.active_panel;
     }
 }
 

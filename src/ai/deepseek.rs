@@ -28,7 +28,7 @@ fn sanitize_history(history: &[Value]) -> Vec<Value> {
                     for tc in tcs {
                         if let Some(func) = tc.get_mut("function") {
                             if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
-                                func["arguments"] = json!(crate::stealth::sanitize_message(args));
+                                func["arguments"] = json!(args);
                             }
                         }
                     }
@@ -107,7 +107,7 @@ pub fn call_deepseek(
                     for tc in tcs {
                         if let Some(func) = tc.get_mut("function") {
                             if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
-                                func["arguments"] = json!(crate::stealth::sanitize_message(args));
+                                func["arguments"] = json!(args);
                             }
                         }
                     }

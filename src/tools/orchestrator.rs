@@ -5,7 +5,7 @@
 //   - $last / $result_N 变量引用前序工具输出
 //   - | 管道语法: tool1 | tool2  
 //   - 智能建议: 根据结果自动推荐下一步工具
-//   - 工作流模板: 预定义工具链 (recon/full_scan/cve_chain)
+//   - 工作流模板: 预定义工具链 (net/full_scan/cve_chain)
 //   - 结果缓存: LRU缓存最近1000条工具结果
 // ============================================================
 
@@ -389,7 +389,7 @@ impl WorkflowEngine {
     /// 获取预定义工作流
     pub fn get_workflow(name: &str) -> Option<Vec<String>> {
         match name.to_lowercase().as_str() {
-            "recon" | "侦察" => Some(vec![
+            "net" | "网络信息" => Some(vec![
                 "dns_lookup $domain".into(),
                 "whois_lookup $domain".into(),
                 "subdomain_enum $domain".into(),
@@ -437,7 +437,7 @@ impl WorkflowEngine {
     /// 列出所有工作流
     pub fn list_workflows() -> String {
         let workflows = [
-            ("recon", "基础侦察 — DNS/WHOIS/子域名/端口"),
+            ("net", "网络信息 — DNS/WHOIS/子域名/端口"),
             ("web", "Web扫描 — HTTP/安全头/目录爆破/Git泄露/SSL"),
             ("full", "全面扫描 — 侦察+Web+SSL+目录"),
             ("vuln", "漏洞扫描 — 端口+Web漏洞+Heartbleed"),
@@ -592,13 +592,13 @@ mod tests {
     #[test]
     fn test_workflow_list() {
         let output = WorkflowEngine::list_workflows();
-        assert!(output.contains("recon"));
+        assert!(output.contains("net"));
         assert!(output.contains("web"));
     }
 
     #[test]
     fn test_workflow_get() {
-        let wf = WorkflowEngine::get_workflow("recon");
+        let wf = WorkflowEngine::get_workflow("net");
         assert!(wf.is_some());
         assert!(wf.unwrap().len() >= 3);
     }

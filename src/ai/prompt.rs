@@ -4,12 +4,12 @@
 use serde_json::{json, Value};
 
 // ── 默认系统提示词 (内置回退, 当 system_prompt.txt 不存在时使用) ──
-const DEFAULT_SYSTEM_PROMPT: &str = r#"你是 RUOO-ARSENAL 的内置 AI 助手 "Zero-Day"，一个全类型专家。
+const DEFAULT_SYSTEM_PROMPT: &str = r#"你是 RUOO-CONSOLE 的内置 AI 助手 "Zero-Day"，一个全类型专家。
 
 ## 身份
 - 代号: Zero-Day
 - 风格: 冷峻，专业、简洁，偶尔带黑色幽默
-- 运行环境: ruoo-arsenal v4.1 TUI 终端作战面板 (Rust + ratatui)
+- 运行环境: ruoo-console v4.1 TUI 终端面板 (Rust + ratatui)
 
 ## 核心能力
 1. 真实工具调用: 所有工具纯Rust实现
@@ -51,8 +51,8 @@ const DEFAULT_SYSTEM_PROMPT: &str = r#"你是 RUOO-ARSENAL 的内置 AI 助手 "
 - 修改代码之前记得备份
 
 ## 特殊规则
-- 不要用exec-cmd打开另一个作战终端这种弱智操作，终端有登录系统，exec-cmd会直接卡住。
-- 不要在工作目录乱扔垃圾，备份请放backup，垃圾文件请放junk files，临时文件请放temporary files，作战结果请放result
+- 不要用exec-cmd打开另一个终端这种弱智操作，终端有登录系统，exec-cmd会直接卡住。
+- 不要在工作目录乱扔垃圾，备份请放backup，垃圾文件请放junk files，临时文件请放temporary files，结果请放result
 
 ## 工具编写
 - 禁止虚假或模拟输出的工具实现
@@ -132,14 +132,18 @@ pub fn build_system_prompt() -> String {
         format!("\n{}", memory_ctx)
     };
 
-    // 尝试从外部文件读取提示词模板, 文件不存在则使用内置默认值
+    // 尝试从外部文件读取提示词模板, 文件不存在则自动写出默认文件
     let template = std::fs::read_to_string("system_prompt.txt")
         .or_else(|_| {
             std::env::current_exe()
                 .map(|p| p.parent().unwrap_or(std::path::Path::new(".")).join("system_prompt.txt"))
                 .and_then(std::fs::read_to_string)
         })
-        .unwrap_or_else(|_| DEFAULT_SYSTEM_PROMPT.to_string());
+        .unwrap_or_else(|_| {
+            // 文件不存在 — 自动写出默认提示词到工作目录
+            let _ = std::fs::write("system_prompt.txt", DEFAULT_SYSTEM_PROMPT);
+            DEFAULT_SYSTEM_PROMPT.to_string()
+        });
 
     // 替换动态占位符
     template
@@ -284,8 +288,8 @@ pub fn build_tools() -> Vec<Value> {
         t1!("ai_message", "AI信息返回 — 中途输出信息到终端，支持\\n换行符", "message", "string", "要输出的消息文本，支持\\n换行"),
 
         // ═══ 工具联动引擎 v1.0 ═══
-        t1!("workflow_list", "列出预定义工作流 — recon/web/full/vuln/email/cve", "dummy", "string", "占位(可留空)"),
-        t2!("workflow_run", "执行工作流 — 返回工具链命令列表,依次执行", "name", "string", "工作流名称(recon/web/full/vuln/email/cve)", "target", "string", "目标(域名或IP)"),
+        t1!("workflow_list", "列出预定义工作流 — net/web/full/vuln/email/cve", "dummy", "string", "占位(可留空)"),
+        t2!("workflow_run", "执行工作流 — 返回工具链命令列表,依次执行", "name", "string", "工作流名称(net/web/full/vuln/email/cve)", "target", "string", "目标(域名或IP)"),
         t1!("tool_suggest", "智能建议 — 根据上次工具结果推荐下一步", "dummy", "string", "占位(可留空)"),
         t1!("cache_stats", "结果缓存统计 — 查看工具联动缓存状态", "dummy", "string", "占位(可留空)"),
 

@@ -8,8 +8,8 @@ pub mod web;
 pub mod orchestrator;
 pub mod compiler;
 pub mod crypto;
-pub mod recon;
-pub mod payloads;
+pub mod net;
+pub mod gen;
 pub mod files;
 pub mod kernel;
 pub mod fault_tolerant;
@@ -21,8 +21,8 @@ pub use compiler::*;
 #[allow(unused_imports)]
 pub use orchestrator::*;
 pub use crypto::*;
-pub use recon::*;
-pub use payloads::*;
+pub use net::*;
+pub use gen::*;
 pub use files::*;
 #[allow(unused_imports)]
 pub use kernel::*;
