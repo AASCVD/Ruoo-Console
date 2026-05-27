@@ -1213,7 +1213,19 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
 #[allow(dead_code)]
 fn auto_load_plugins(app: &mut App) {
     let plugins_dir = std::path::PathBuf::from("plugins");
-    if !plugins_dir.exists() || !plugins_dir.is_dir() {
+    if !plugins_dir.exists() {
+        match std::fs::create_dir(&plugins_dir) {
+            Ok(()) => {
+                app.push_output("[+] 已创建 plugins 目录");
+            }
+            Err(e) => {
+                app.push_output(&format!("[!] 无法创建 plugins 目录: {}", e));
+                return;
+            }
+        }
+    }
+    if !plugins_dir.is_dir() {
+        app.push_output("[!] plugins 路径存在但不是目录，跳过自动加载");
         return;
     }
 
@@ -1788,6 +1800,14 @@ fn main() -> io::Result<()> {
             app.push_output("[!] Vault 初始化可能失败 — 检查磁盘权限");
         }
     }
+    // ── 确保 plugins 目录存在 ──
+    let plugins_dir = std::path::PathBuf::from("plugins");
+    if !plugins_dir.exists() {
+        if let Err(e) = std::fs::create_dir(&plugins_dir) {
+            app.push_output(&format!("[!] 无法创建 plugins 目录: {}", e));
+        }
+    }
+
     let vault_exists = vault_base_dir.join("vault.rdb").exists();
     app.vault_base_dir = Some(vault_base_dir);
     app.max_login_attempts = if vault_exists { 3 } else { 5 };
