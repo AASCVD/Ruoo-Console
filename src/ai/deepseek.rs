@@ -159,8 +159,8 @@ pub fn call_deepseek(
             .max_idle_connections(0)
             .max_idle_connections_per_host(0)
             .timeout_connect(std::time::Duration::from_secs(30))
-            .timeout_read(std::time::Duration::from_secs(900))
-            .timeout_write(std::time::Duration::from_secs(60))
+            .timeout_read(std::time::Duration::ZERO)
+            .timeout_write(std::time::Duration::from_secs(120))
             .build();
 
         let response = match client

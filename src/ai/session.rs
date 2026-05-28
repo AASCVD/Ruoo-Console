@@ -96,7 +96,6 @@ impl AiSession {
         let mut tool_logs = Vec::new();
         let mut final_content = String::new();
         const MAX_ROUNDS: u32 = 3000;
-        const TOOL_HARD_TIMEOUT_MS: u64 = 300_000; // 单个工具硬超时 5分钟
 
         for round in 0..MAX_ROUNDS {
             if let Some(c) = cancel {
@@ -167,7 +166,6 @@ impl AiSession {
                             };
                             let _ = tx_result.send(result);
                         });
-                        let tool_start = std::time::Instant::now();
                         let result_full = loop {
                             match rx_result.recv_timeout(std::time::Duration::from_millis(100)) {
                                 Ok(res) => break res,
@@ -181,11 +179,6 @@ impl AiSession {
                                         if c.load(std::sync::atomic::Ordering::Relaxed) {
                                             break format!("[!] 工具 {} 已被用户取消 (Esc)", tc.name);
                                         }
-                                    }
-                                    // 硬超时保护
-                                    if tool_start.elapsed().as_millis() > TOOL_HARD_TIMEOUT_MS as u128 {
-                                        break format!("[!] 工具 {} 执行超时 (>{:.0}s) — 已强制中断，线程后台回收",
-                                            tc.name, TOOL_HARD_TIMEOUT_MS as f64 / 1000.0);
                                     }
                                 }
                                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
