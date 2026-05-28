@@ -1,5 +1,5 @@
 ﻿// ============================================================
-// RUOO-ARSENAL v4.0 — Command Processing & Help
+// RUOO-CONSOLE v4.0 — Command Processing & Help
 // All tools use real implementations from tools.rs
 // Async: heavy commands run on background threads (no UI freeze)
 // Progress bar: scan + subdomain show real-time progress
@@ -93,7 +93,7 @@ pub(crate) fn _spawn(
         .expect("spawn thread");
 }
 // ═══════════════════════════════════════════════════════
-// RUOO-ARSENAL v7.1 — 统一命令注册表
+// RUOO-CONSOLE v7.1 — 统一命令注册表
 // 唯一真相源: src/commands/mod_meta.rs → all_commands()
 // help / tab_complete 均动态读取 mod_meta
 // 添加新命令: 在 mod_meta.rs ALL 数组添加 tuple 即可

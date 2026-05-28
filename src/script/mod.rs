@@ -1,5 +1,5 @@
 // ============================================================
-// RUOO-ARSENAL �?脚本引擎 v3.1 (.ruoo)
+// RUOO-CONSOLE �?脚本引擎 v3.1 (.ruoo)
 //
 // v3.1 更新:
 pub mod plugin_stderr; // StderrCapture — 插件stderr重定向到TUI输出
@@ -1269,7 +1269,7 @@ pub fn create_template(name: &str) -> Result<String, String> {
 
     let template = format!(
         r#"# =================================
-# RUOO-ARSENAL 脚本: {name}
+# RUOO-CONSOLE 脚本: {name}
 # 安全: script permit {name} 授权后执�?
 # =================================
 

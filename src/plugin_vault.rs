@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// RUOO-ARSENAL v7.0 — 插件保险库 (Plugin Vault)
+// RUOO-CONSOLE v7.0 — 插件保险库 (Plugin Vault)
 //
 // 插件文件全生命周期加密:
 //   1. 注册时: 插件.dll → AES-256-GCM加密 → plugins_vault/*.enc

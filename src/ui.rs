@@ -1,5 +1,5 @@
 // ============================================================
-// RUOO-ARSENAL — UI 渲染 (v4.1.0 — 软件光标闪烁)
+// RUOO-CONSOLE — UI 渲染 (v4.1.0 — 软件光标闪烁)
 // ============================================================
 
 use chrono::Local;
@@ -338,7 +338,7 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
         Span::styled("", Style::default())
     };
     let title = Line::from(vec![
-        Span::styled("RUOO-ARSENAL", Style::default().fg(theme::CYBER).add_modifier(Modifier::BOLD)),
+        Span::styled("RUOO-CONSOLE", Style::default().fg(theme::CYBER).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(theme::MUTED)),
         Span::styled(" |", Style::default().fg(theme::MUTED)),
         Span::styled(panel_tag, Style::default().fg(theme::ACCENT)),
@@ -517,7 +517,7 @@ fn render_help_page(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // ── 标题栏 ──
     let title = Line::from(vec![
-        Span::styled("RUOO-ARSENAL", Style::default().fg(theme::CYBER).add_modifier(Modifier::BOLD)),
+        Span::styled("RUOO-CONSOLE", Style::default().fg(theme::CYBER).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(theme::MUTED)),
         Span::styled(" | ", Style::default().fg(theme::MUTED)),
         Span::styled("帮助页面", Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)),
@@ -898,7 +898,7 @@ fn render_password_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         theme::ACCENT
     };
     let title = Line::from(vec![
-        Span::styled(" RUOO-ARSENAL ", Style::default().fg(theme::CYBER).add_modifier(Modifier::BOLD)),
+        Span::styled(" RUOO-CONSOLE ", Style::default().fg(theme::CYBER).add_modifier(Modifier::BOLD)),
         Span::styled("v4.5", Style::default().fg(theme::MUTED)),
         Span::styled(" │ ", Style::default().fg(theme::MATRIX_DIM)),
         Span::styled(phase_title, Style::default().fg(title_color)),

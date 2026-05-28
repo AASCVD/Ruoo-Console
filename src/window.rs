@@ -1,5 +1,5 @@
 // ============================================================
-// RUOO-ARSENAL v5.2 — 窗口控制模块
+// RUOO-CONSOLE v5.2 — 窗口控制模块
 // 隐藏到系统托盘 (Shell_NotifyIcon) + 全局热键恢复
 // 从任务栏彻底消失 → 仅托盘图标可见, 右键菜单 Show/Exit
 // Windows: ShowWindow + RegisterHotKey + Shell_NotifyIcon + 消息窗口

@@ -1,5 +1,5 @@
 // ============================================================
-// RUOO-ARSENAL v4.8 — 内核驱动工具接口 (Kernel Driver Interface)
+// RUOO-CONSOLE v4.8 — 内核驱动工具接口 (Kernel Driver Interface)
 //
 // 设计理念:
 //   - 提供统一的 trait 抽象，用户可实现自己的底层驱动后端

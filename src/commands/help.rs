@@ -1,5 +1,5 @@
 // ============================================================
-// RUOO-ARSENAL 帮助系统 v10.0 — 插件按分类分组 + 动态分页
+// RUOO-CONSOLE 帮助系统 v10.0 — 插件按分类分组 + 动态分页
 // 
 // v10.0 变更:
 //   - 插件命令不再全部挤在"外部插件"下，按 category 字段(来自manifest)分组
@@ -264,7 +264,7 @@ pub fn help_page(page: usize, app: &crate::App) -> Vec<String> {
     if all_categories.is_empty() {
         return vec![
             String::new(),
-            "══ RUOO-ARSENAL 帮助 — 无可用命令 ══".into(),
+            "══ RUOO-CONSOLE 帮助 — 无可用命令 ══".into(),
         ];
     }
 
@@ -316,7 +316,7 @@ pub fn help_page(page: usize, app: &crate::App) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     out.push(String::new());
     out.push(format!(
-        "══ RUOO-ARSENAL 帮助 — 第{}/{}页: {} ({}命令) ══",
+        "══ RUOO-CONSOLE 帮助 — 第{}/{}页: {} ({}命令) ══",
         page, total_pages, title_summary, total_cmds
     ));
     out.push(format!(

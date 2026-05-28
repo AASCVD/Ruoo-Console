@@ -1,5 +1,5 @@
 // ============================================================
-// RUOO-ARSENAL — 启动加载脚本 (Bootscript) v1.0
+// RUOO-CONSOLE — 启动加载脚本 (Bootscript) v1.0
 //
 // 功能:
 //   - 程序启动后自动执行 (Vault 挂载后)
@@ -22,7 +22,7 @@ const BOOTSCRIPT_KEY: &str = "script";
 
 /// 默认启动脚本模板
 pub fn default_bootscript() -> String {
-    r#"# RUOO-ARSENAL 启动加载脚本
+    r#"# RUOO-CONSOLE 启动加载脚本
 # 此脚本在程序启动并挂载 Vault 后自动执行
 # 可用于: 显示欢迎信息、加载插件、设置变量、执行其他脚本等
 #
@@ -32,7 +32,7 @@ pub fn default_bootscript() -> String {
 #       bootscript run   → 手动执行
 #       bootscript status → 查看状态
 
-echo "=== RUOO-ARSENAL v4.2 ==="
+echo "=== RUOO-CONSOLE v4.2 ==="
 echo "启动加载脚本已执行"
 echo "输入 help 查看可用命令"
 

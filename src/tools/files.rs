@@ -1,5 +1,5 @@
 // ============================================================
-// RUOO-ARSENAL v4.0 — 文件操作模块
+// RUOO-CONSOLE v4.0 — 文件操作模块
 // read/write/append/create/delete/copy/move
 // list/search/grep/stat/hash/hexdump/mime
 // mkdir/rmdir/cd/pwd/du
@@ -2582,7 +2582,7 @@ pub fn search_export(
     let mut total_lines: u64 = 0;
 
     // 写入文件头
-    writeln!(out_file, "# RUOO-ARSENAL 搜索结果导出")
+    writeln!(out_file, "# RUOO-CONSOLE 搜索结果导出")
         .map_err(|e| format!("写入失败: {}", e))?;
     writeln!(out_file, "# 源文件: {}", p.display())
         .map_err(|e| format!("写入失败: {}", e))?;

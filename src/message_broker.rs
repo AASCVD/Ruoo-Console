@@ -1,5 +1,5 @@
 // ============================================================
-// RUOO-ARSENAL v5.2 — 消息输出代理 (Message Broker)
+// RUOO-CONSOLE v5.2 — 消息输出代理 (Message Broker)
 //
 // v5.2 新增:
 //   - 插件间通信消息 (InterPlugin)

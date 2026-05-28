@@ -1,5 +1,5 @@
 // ============================================================
-// RUOO-ARSENAL v9.3 — 容错系统 (Fault Tolerance)
+// RUOO-CONSOLE v9.3 — 容错系统 (Fault Tolerance)
 // PoisonResistantMutex | GuardThread | ToolGuard | Recover
 // ============================================================
 
