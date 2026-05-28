@@ -3,6 +3,7 @@
 
 use serde_json::{json, Value};
 use crate::ai::types::{AiResponse, ToolCall, StreamMsg, StreamKind};
+// DNS解析使用系统默认 — 不再硬编码IP（硬编码IP过期会导致持续超时）
 
 /// 发送前清理: 移除失去 tool_calls 父亲的孤儿 tool/assistant 消息对
 fn sanitize_history(history: &[Value]) -> Vec<Value> {
@@ -158,9 +159,9 @@ pub fn call_deepseek(
         let client = ureq::AgentBuilder::new()
             .max_idle_connections(0)
             .max_idle_connections_per_host(0)
-            .timeout_connect(std::time::Duration::from_secs(30))
-            .timeout_read(std::time::Duration::ZERO)
-            .timeout_write(std::time::Duration::from_secs(120))
+            .timeout_connect(std::time::Duration::from_secs(15))
+            .timeout_read(std::time::Duration::from_secs(120))
+            .timeout_write(std::time::Duration::from_secs(60))
             .build();
 
         let response = match client

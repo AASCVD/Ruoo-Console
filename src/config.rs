@@ -123,7 +123,7 @@ fn default_false() -> bool { false }
 fn default_theme_name() -> String { String::from("cyber") }
 fn default_font_size() -> u32 { 14 }
 fn default_timeout() -> u64 { 30_000 }
-fn default_connect_timeout() -> u64 { 3_000 }
+fn default_connect_timeout() -> u64 { 10_000 }
 fn default_exec_timeout() -> u64 { 120_000 }
 fn default_port_range() -> String { String::from("1-10000") }
 fn default_max_history() -> usize { 500 }
@@ -372,7 +372,7 @@ impl Default for AppConfig {
             exec_timeout_ms: default_exec_timeout(),
             deepseek_api_key: String::new(),
             deepseek_model: default_ds_model(),
-            ai_enabled: false,
+            ai_enabled: true,
             deepseek_system_prompt: String::new(),
         }
     }
