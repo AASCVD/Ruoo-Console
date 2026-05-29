@@ -172,4 +172,4 @@ mod imp {
     }
 }
 
-pub use imp::StderrCapture;
+
