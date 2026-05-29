@@ -2,7 +2,7 @@
 cd /d "%~dp0"
 
 echo ============================================================
-echo   RUOO-ARSENAL // Build + Launch
+echo   RUOO-CONSOLE // Build + Launch
 echo ============================================================
 echo.
 
