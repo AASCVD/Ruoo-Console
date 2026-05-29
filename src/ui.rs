@@ -913,6 +913,14 @@ fn render_password_screen(frame: &mut Frame, app: &mut App, area: Rect) {
         inner[1],
     );
 
+    // 错误信息行 (★ BUG-FIX: 显示login_error, 之前错误被静默隐藏)
+    if !app.login_error.is_empty() {
+        let err_line = Line::from(vec![
+            Span::styled(format!("  ⚠ {}", app.login_error), Style::default().fg(theme::DANGER).add_modifier(Modifier::BOLD)),
+        ]);
+        frame.render_widget(Paragraph::new(err_line), inner[2]);
+    }
+
     // 提示行
     let prompt_display = if app.password_prompt.is_empty() {
         "🔑 输入主密码"

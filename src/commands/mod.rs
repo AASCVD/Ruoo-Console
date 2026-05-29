@@ -583,8 +583,14 @@ fn cmd_config(app: &mut App, arg1: &Option<String>, rest: Option<&str>) {
 }
 
 fn cmd_dpai(app: &mut App) {
-    // ★ 使用 resolve_api_key 从 Vault/明文获取 API Key
-    let api_key = app.cfg.resolve_api_key(app.vault.as_deref());
+    // ★ v4.1.1: 先检查 ai_enabled 总开关
+    if !app.cfg.ai_enabled {
+        app.push_output("[!] AI 助手已被禁用 (ai_enabled=false)");
+        app.push_output("[*] 请执行: config set ai_enabled=true");
+        return;
+    }
+    // ★ 使用 resolve_api_key_with_source 获取 Key + 来源追踪
+    let (api_key, key_source) = app.cfg.resolve_api_key_with_source(app.vault.as_deref());
     if api_key.is_empty() {
         app.push_output("[!] DeepSeek API Key 未配置");
         app.push_output("[*] 请执行: config set deepseek_api_key=sk-xxx");
@@ -600,11 +606,21 @@ fn cmd_dpai(app: &mut App) {
         app.ai_session = Some(session);
         app.push_output("[+] ========== #dp DeepSeek AI 已激活 ==========");
         app.push_output("[+] &<消息> 普通AI对话 | &%<消息> 实时流式输出");
-        app.push_output(&format!("[+] 模型: {} | 工具数: {} | qwq ", app.cfg.deepseek_model, tool_count));
-        // ★ 明文 API Key 安全警告（不破坏 TUI）
-        if crate::config::has_plaintext_api_key(&app.cfg) {
-            app.push_output(crate::config::api_key_plaintext_warning());
-            app.push_output("[*] 建议: vault add api_keys deepseek <key> → 迁移到加密 Vault");
+        app.push_output(&format!("[+] 模型: {} | 工具数: {}", app.cfg.deepseek_model, tool_count));
+        // ★ 报告 Key 来源，让用户知道 Key 从哪里取到的
+        match key_source {
+            crate::config::KeySource::VaultApiKeys => {
+                app.push_output("[*] Key 来源: Vault 加密存储 (api_keys/deepseek)");
+            }
+            crate::config::KeySource::VaultDefaultBackCompat => {
+                app.push_output("[!] Key 来源: Vault 旧格式 (default/api_keys) — 建议迁移:");
+                app.push_output("[*]   执行: vault set api_keys deepseek <key>  后删除旧条目");
+            }
+            crate::config::KeySource::ConfigPlaintext => {
+                app.push_output(crate::config::api_key_plaintext_warning());
+                app.push_output("[*] 建议: vault add api_keys deepseek <key> → 迁移到加密 Vault");
+            }
+            crate::config::KeySource::None => {} // unreachable due to is_empty check above
         }
     } else {
         app.ai_session = None;
@@ -1111,7 +1127,7 @@ pub fn process_ai_query(app: &mut App, query: &str, stream_mode: bool) {
         }
     }
 
-    let api_key = app.cfg.resolve_api_key(app.vault.as_deref());
+    let (api_key, key_source) = app.cfg.resolve_api_key_with_source(app.vault.as_deref());
     let api_url = app.cfg.deepseek_api_url.clone();
     let model = app.cfg.deepseek_model.clone();
 
@@ -1122,6 +1138,11 @@ pub fn process_ai_query(app: &mut App, query: &str, stream_mode: bool) {
         app.push_output("[*] 或者: vault set api_keys deepseek <key> (加密存储)");
         app.ai_pending = false;
         return;
+    }
+
+    // ★ v4.1.1: 熔断恢复后报告 Key 来源 (帮助诊断连接问题)
+    if key_source == crate::config::KeySource::VaultDefaultBackCompat {
+        app.push_output("[*] Key 来自 Vault 旧格式 (default/api_keys) — 建议迁移到 api_keys/deepseek");
     }
 
     if app.ai_session.is_none() {

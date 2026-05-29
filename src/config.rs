@@ -145,20 +145,58 @@ fn default_ds_api_url() -> String { String::from("https://api.deepseek.com/v1/ch
 fn default_ds_model() -> String { String::from("deepseek-v4-pro") }
 
 // ── 路径 ──
-/// Vault 数据目录 (~/.ruoo/)
-pub fn data_dir() -> PathBuf {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".ruoo")
+/// exe 所在目录 (应用启动位置)
+/// ★ BUG-FIX: current_exe() 失败时不再回退到相对路径 "." (会随工作目录飘移)，
+///   改用 args[0] 或当前工作目录的 canonicalize 结果，确保 exe_dir 始终是绝对路径
+fn exe_dir() -> PathBuf {
+    // 尝试1: 标准方式获取可执行文件路径
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    // 尝试2: 从 argv[0] 获取 (回退方案)
+    if let Some(arg0) = std::env::args().next() {
+        let p = std::path::PathBuf::from(&arg0);
+        // 如果是相对路径，相对于当前目录解析
+        let abs = if p.is_relative() {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")).join(&p)
+        } else {
+            p
+        };
+        // canonicalize 解析所有符号链接和相对路径
+        if let Ok(canon) = std::fs::canonicalize(&abs) {
+            if let Some(parent) = canon.parent() {
+                return parent.to_path_buf();
+            }
+            return canon; // 如果是根目录自身
+        }
+        // canonicalize 失败, 手动解析
+        if let Some(parent) = abs.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    // 尝试3: 终极回退 — 当前工作目录的绝对路径
+    if let Ok(cwd) = std::env::current_dir() {
+        return cwd;
+    }
+    // 绝望回退
+    std::path::PathBuf::from(".")
 }
 
-fn config_path() -> PathBuf {
-    std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("arsenal_config.json")
+/// 数据目录 — exe所在目录/.ruoo/
+/// 所有 ruoo 实例各自独立，数据库不跨终端共享
+pub fn data_dir() -> PathBuf {
+    exe_dir().join(".ruoo")
+}
+
+pub fn config_path() -> PathBuf {
+    data_dir().join("arsenal_config.json")
+}
+
+/// 检查配置文件是否已存在 (首次启动检测)
+pub fn config_file_exists() -> bool {
+    config_path().exists()
 }
 
 // ── 公开 API ──
@@ -222,19 +260,34 @@ pub fn api_key_plaintext_warning() -> &'static str {
     "[!] ⚠ API Key 以明文存储在 arsenal_config.json 中 — 建议迁移到 Vault"
 }
 
+// ── Key 来源追踪 (v4.1.1) ──
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum KeySource {
+    None,
+    VaultApiKeys,
+    VaultDefaultBackCompat,
+    ConfigPlaintext,
+}
+
 // ── 运行时修改 ──
 impl AppConfig {
     /// ★ BUG-4 修复: 安全获取 API Key — Vault 优先, 明文配置兜底
     /// 若 Vault 中存储了 api_keys.deepseek，优先使用；否则回退到配置文件明文值
     /// 同时在首次从明文配置读取时发出安全警告
     pub fn resolve_api_key(&self, vault: Option<&crate::vault::Vault>) -> String {
+        let (key, _) = self.resolve_api_key_with_source(vault);
+        key
+    }
+
+    /// ★ v4.1.1: 带来源追踪的 Key 获取 — 让 cmd_dpai 知道 Key 从哪里取到
+    pub fn resolve_api_key_with_source(&self, vault: Option<&crate::vault::Vault>) -> (String, KeySource) {
         // 优先从 Vault 读取 (已加密存储)
         if let Some(v) = vault {
             if v.is_mounted() {
                 // 1. 标准路径: namespace="api_keys", key="deepseek"
                 if let Some(enc_key) = v.get("api_keys", "deepseek") {
                     if !enc_key.is_empty() {
-                        return enc_key;
+                        return (enc_key, KeySource::VaultApiKeys);
                     }
                 }
                 // 2. 向后兼容: 旧版 vault add api_keys deepseek <key> 
@@ -245,20 +298,23 @@ impl AppConfig {
                         // 尝试从旧格式 "deepseek sk-xxx" 中提取 key
                         for part in raw_val.split_whitespace() {
                             if part.starts_with("sk-") {
-                                return part.to_string();
+                                return (part.to_string(), KeySource::VaultDefaultBackCompat);
                             }
                         }
                         // 如果值本身就是 key (无空格)
                         if raw_val.starts_with("sk-") {
-                            return raw_val;
+                            return (raw_val, KeySource::VaultDefaultBackCompat);
                         }
                     }
                 }
             }
         }
         // 回退到配置文件明文值 (兼容旧配置)
-        // 安全警告通过 has_plaintext_api_key / api_key_plaintext_warning 由 TUI 层展示
-        self.deepseek_api_key.clone()
+        if self.deepseek_api_key.is_empty() {
+            (String::new(), KeySource::None)
+        } else {
+            (self.deepseek_api_key.clone(), KeySource::ConfigPlaintext)
+        }
     }
 
     /// ★ BUG-4 修复: 将 API Key 保存到 Vault 并从明文配置中清除
@@ -372,7 +428,7 @@ impl Default for AppConfig {
             exec_timeout_ms: default_exec_timeout(),
             deepseek_api_key: String::new(),
             deepseek_model: default_ds_model(),
-            ai_enabled: true,
+            ai_enabled: false,
             deepseek_system_prompt: String::new(),
         }
     }

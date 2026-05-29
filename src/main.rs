@@ -603,33 +603,6 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
                             app.password_action = format!("login_confirm:{}", password);
                         }
                     }
-                    "login_confirm" => {
-                        // 确认密码: 比对 → 创建Vault
-                        let parts: Vec<&str> = action.splitn(2, ':').collect();
-                        let first_pw = parts.get(1).copied().unwrap_or("");
-                        if password != first_pw {
-                            app.login_error = "两次密码不匹配!".into();
-                            app.login_phase = LoginPhase::LoginFailed;
-                            app.password_mode = true;
-                            app.password_prompt = "[NEW] 创建主密码 (>=12字符)".into();
-                            app.password_action = "login_create".into();
-                        } else {
-                            // 创建Vault
-                            match do_create_vault(app, &password) {
-                                Ok(()) => {
-                                    app.login_phase = LoginPhase::None;
-                                    // login流程完成, 继续正常TUI
-                                }
-                                Err(e) => {
-                                    app.login_error = e;
-                                    app.login_phase = LoginPhase::LoginFailed;
-                                    app.password_mode = true;
-                                    app.password_prompt = "[NEW] 创建主密码 (>=12字符)".into();
-                                    app.password_action = "login_create".into();
-                                }
-                            }
-                        }
-                    }
                     "unlock" => do_unlock(app, &password),
                     "passwd_old" => {
                         // 第一阶段: 收集旧密码 → 进入第二阶段
@@ -641,8 +614,38 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
                     }
                     "lock" => do_lock(app),
                     _ => {
+                        // login_confirm → 确认首次创建密码 (★ BUG-FIX: starts_with 而非精确匹配)
+                        if action.starts_with("login_confirm:") {
+                            let first_pw = action.strip_prefix("login_confirm:").unwrap_or("");
+                            if password != first_pw {
+                                app.login_error = "两次密码不匹配!".into();
+                                app.login_phase = LoginPhase::LoginFailed;
+                                app.password_mode = true;
+                                app.password_prompt = "[NEW] 创建主密码 (>=12字符)".into();
+                                app.password_action = "login_create".into();
+                                app.push_output(&format!("[!] 两次输入的密码不匹配，请重新创建"));
+                            } else {
+                                app.push_output("[*] 密码确认成功，正在创建加密数据库...");
+                                match do_create_vault(app, &password) {
+                                    Ok(()) => {
+                                        app.login_phase = LoginPhase::None;
+                                        app.password_mode = false;
+                                        app.password_action.clear();
+                                        app.push_output("[+] 登录完成 — 欢迎使用 RUOO-CONSOLE");
+                                    }
+                                    Err(e) => {
+                                        app.login_error = e.clone();
+                                        app.login_phase = LoginPhase::LoginFailed;
+                                        app.password_mode = true;
+                                        app.password_prompt = "[NEW] 创建主密码 (>=12字符)".into();
+                                        app.password_action = "login_create".into();
+                                        app.push_output(&format!("[!] 数据库创建失败: {}", e));
+                                        app.push_output("[*] 请检查磁盘权限后重试，或更换启动目录");
+                                    }
+                                }
+                            }
                         // passwd_new → 第三阶段: 收集确认密码
-                        if action.starts_with("passwd_new:") {
+                        } else if action.starts_with("passwd_new:") {
                             let old_password = action.strip_prefix("passwd_new:").unwrap_or("");
                             // ★ BUG-19: 去除尾部\x1F分隔符
                             let old_password = old_password.trim_end_matches('\x1F');
@@ -1425,7 +1428,7 @@ fn do_create_vault(app: &mut App, password: &str) -> Result<(), String> {
     app.login_phase = LoginPhase::None;
     app.push_output("[+] Vault 已创建 — 加密数据库就绪");
     app.push_output("[+] Vault 已挂载 — AI/tools 加密存储可用");
-    app.push_output("[*] 备份提示: 定期备份 ~/.ruoo/vault.rdb 和 vault.salt");
+    app.push_output("[*] 备份提示: 定期备份 vault.rdb 和 vault.salt");
     app.push_output("[*] 命令: vault 查看状态 | lock 锁定 | unlock 解锁 | passwd 改密");
     let vault_arc = Arc::new(vault);
     crate::vault::set_global_vault(vault_arc.clone());
@@ -1805,6 +1808,17 @@ fn main() -> io::Result<()> {
     if !plugins_dir.exists() {
         if let Err(e) = std::fs::create_dir(&plugins_dir) {
             app.push_output(&format!("[!] 无法创建 plugins 目录: {}", e));
+        }
+    }
+
+    // ★ 首次启动: 自动生成默认配置文件 (让用户知道在哪配置 API Key)
+    if !crate::config::config_file_exists() {
+        match crate::config::save_config(&app.cfg) {
+            Ok(()) => app.push_output(&format!(
+                "[+] 首次启动 — 已生成默认配置文件: {}",
+                crate::config::config_path().display()
+            )),
+            Err(e) => app.push_output(&format!("[!] 无法生成配置文件: {}", e)),
         }
     }
 
