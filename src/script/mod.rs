@@ -746,7 +746,7 @@ pub fn execute_script(
         }
     } else {
         // �?v4.3 fix: 将脚本加载的插件迁移到终端全局 PluginManager
-        let merged = app.plugin_mgr.merge_from(&mut ctx.plugins);
+        let merged = app.plugin_mgr.lock().unwrap().merge_from(&mut ctx.plugins);
         app.push_output(&format!("[s] 插件持久�? {} 个插件迁移到终端 (bootscript)", merged));
     }
 
@@ -975,8 +975,9 @@ fn execute_instruction(
 
             // �?v4.3: 探测 ruoo_plugin_commands 并注册到终端命令路由�?
             // 这样插件命令会出现在 help 中，用户可直接输入命令名调用
-            if let Some(lib) = ctx.plugins.get_library(name) {
-                match crate::plugin::try_register_from_library(lib, name, &mut app.cmd_registry) {
+            let dll_path = ctx.plugins.loaded.get(name).map(|i| i.path.to_string_lossy().to_string());
+            if let Some(ref path) = dll_path {
+                match crate::plugin::try_register_from_file(path, name, &mut app.cmd_registry) {
                     Ok(count) if count > 0 => {
                         let cmds: Vec<String> = app.cmd_registry.list_by_plugin(name)
                             .iter()
@@ -1063,8 +1064,9 @@ fn execute_instruction(
                     app.push_output(&msg);
                     // �?v4.3: 热重载后重新探测并注册命�?
                     app.cmd_registry.unregister_plugin(plugin);
-                    if let Some(lib) = ctx.plugins.get_library(plugin) {
-                        match crate::plugin::try_register_from_library(lib, plugin, &mut app.cmd_registry) {
+                    let dll_path = ctx.plugins.loaded.get(plugin).map(|i| i.path.to_string_lossy().to_string());
+                    if let Some(ref path) = dll_path {
+                        match crate::plugin::try_register_from_file(path, plugin, &mut app.cmd_registry) {
                             Ok(count) if count > 0 => {
                                 app.push_output(&format!("[plugin] ✅ 热重载后重新注册 {} 个命令", count));
                             }

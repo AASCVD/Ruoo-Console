@@ -1,19 +1,17 @@
-// === 全局状态变量 + 访问器 ===
-// GLOBAL_PLUGIN_MGR, GLOBAL_CMD_REGISTRY, GLOBAL_PLUGIN_REGISTRY,
+// === 全局状态变量 + 访问器 (v9.0 统一) ===
+// GLOBAL_CMD_REGISTRY, GLOBAL_PLUGIN_REGISTRY,
 // AI_PERM_LEVEL, CLEAR_HISTORY_FLAG, TOOL_ABORT_FLAG
+//
+// v9.0: GLOBAL_PLUGIN_MGR 已迁移到 script::plugin_mgr 统一单例
+//       所有插件操作通过 script::get_global_plugin_manager() / global_plugin_manager()
 
 use std::sync::{Arc, OnceLock};
 use crate::ai::types::AiPermLevel;
 
-// ── 全局持久插件管理器 — 供 AI plugin_load/plugin_call 使用 ──
-pub(crate) static GLOBAL_PLUGIN_MGR: std::sync::Mutex<Option<crate::script::PluginManager>> =
-    std::sync::Mutex::new(None);
+// ── 全局命令注册表 — 供 AI plugin_load/help 使用 ──
 pub(crate) static GLOBAL_CMD_REGISTRY: std::sync::Mutex<Option<crate::plugin::CommandRegistry>> =
     std::sync::Mutex::new(None);
 
-pub(crate) fn global_plugin_mgr() -> std::sync::MutexGuard<'static, Option<crate::script::PluginManager>> {
-    GLOBAL_PLUGIN_MGR.lock().unwrap_or_else(|e| e.into_inner())
-}
 pub(crate) fn global_cmd_registry() -> std::sync::MutexGuard<'static, Option<crate::plugin::CommandRegistry>> {
     GLOBAL_CMD_REGISTRY.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -26,20 +24,41 @@ where F: FnOnce(&crate::plugin::CommandRegistry) -> R
     guard.as_ref().map(f)
 }
 
-/// 获取全局插件管理器引用
+// ── v9.0: 插件管理器统一访问器 (指向 script::plugin_mgr 全局单例) ──
+
+/// 获取全局 PluginManager 的 Arc 引用
+pub fn global_plugin_mgr() -> Option<Arc<std::sync::Mutex<crate::script::PluginManager>>> {
+    crate::script::get_global_plugin_manager()
+}
+
+/// 获取全局 PluginManager (必须已初始化)
+pub fn require_plugin_mgr() -> Arc<std::sync::Mutex<crate::script::PluginManager>> {
+    crate::script::global_plugin_manager()
+}
+
+/// 获取全局插件管理器引用 (只读)
 pub fn with_global_plugin_mgr<F, R>(f: F) -> Option<R>
 where F: FnOnce(&crate::script::PluginManager) -> R
 {
-    let guard = GLOBAL_PLUGIN_MGR.lock().ok()?;
-    guard.as_ref().map(f)
+    let mgr = crate::script::get_global_plugin_manager()?;
+    let guard = mgr.lock().ok()?;
+    Some(f(&*guard))
 }
 
 /// 获取全局插件管理器可变引用 (供 commands.rs 调用)
 pub fn with_global_plugin_mgr_mut<F, R>(f: F) -> Option<R>
 where F: FnOnce(&mut crate::script::PluginManager) -> R
 {
-    let mut guard = GLOBAL_PLUGIN_MGR.lock().ok()?;
-    guard.as_mut().map(f)
+    let mgr = crate::script::get_global_plugin_manager()?;
+    let mut guard = mgr.lock().ok()?;
+    Some(f(&mut *guard))
+}
+
+/// 向后兼容: 旧代码中返回 MutexGuard<Option<PluginManager>> 的地方
+/// 已废弃 — 新代码应使用 global_plugin_mgr() + lock()
+#[deprecated(note = "使用 global_plugin_mgr() + lock() 替代")]
+pub(crate) fn _global_plugin_mgr_legacy() -> std::sync::MutexGuard<'static, Option<crate::script::PluginManager>> {
+    panic!("已废弃: 请使用 global_plugin_mgr() + lock()")
 }
 
 // ── 全局插件注册表引用 — 供 AI plugin_reg/unreg/enable/disable 使用 ──

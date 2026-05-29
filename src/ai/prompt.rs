@@ -239,6 +239,8 @@ pub fn build_tools() -> Vec<Value> {
         // ── 插件防崩溃 v5.0 ──
         t1!("plugin_force_unload", "强制卸载插件 — 跳过shutdown直接drop库, 用于崩溃插件强制清理, 防止终端崩溃", "name", "string", "插件别名"),
         t1!("plugin_crash_recover", "插件崩溃恢复 — 自动诊断故障插件+生成详细CrashReport+强制卸载, AI可用来恢复崩溃的插件", "name", "string", "插件别名"),
+        t1!("plugin_restart", "插件软重启 — 崩溃后一键卸载+重载+注册命令+重置熔断器, 无需重启终端即可恢复插件 (v7.1)", "name", "string", "插件别名"),
+        t0!("plugin_recover_all", "批量恢复所有故障插件 — 自动检测并软重启所有崩溃/故障的插件 (v7.1)"),
         t1!("plugin_reload", "热重载插件 — 卸载旧版→加载新版(同路径), 失败自动回滚。用于更新插件DLL后重新加载", "name", "string", "插件别名"),
         t1!("plugin_health", "插件健康检查 — 返回HEALTHY/DEGRADED/FAULTED状态+崩溃次数", "name", "string", "插件别名(空=全部)"),
         // ── 插件注册表 v5.0 ──

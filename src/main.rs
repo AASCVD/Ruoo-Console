@@ -29,6 +29,7 @@ mod window;
 mod crypto_channel;
 mod panic_guard;
 mod telemetry;
+mod plugin_host;
 
 use chrono::Local;
 use crossterm::{
@@ -105,12 +106,16 @@ fn install_crash_defense() {
         let crash_msg = format!("[CRASH {}] {} | {}", ts, loc, payload);
         eprintln!("{}", crash_msg);
 
-        // ★ BUG-LOW 修复: 崩溃日志脱敏 — 限制回溯行数，不记录敏感请求参数
-        // 日志写入 %TEMP%/ruoo_crash.log，避免泄露用户输入和工具参数
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(std::env::temp_dir().join("ruoo_crash.log"))
+        // 崩溃日志 → 工作目录/log/ruoo_crash.log
+        {
+            let log_dir = std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join("log");
+            let _ = std::fs::create_dir_all(&log_dir);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_dir.join("ruoo_crash.log"))
         {
             use std::io::Write;
             let _ = writeln!(f, "{}", crash_msg);
@@ -129,6 +134,32 @@ fn install_crash_defense() {
             let _ = writeln!(f, "  (回溯已截断，完整堆栈请使用调试器)");
             let _ = writeln!(f);
             let _ = f.flush();
+        }
+        }
+
+        // v4.6: 防御性截获 lifecycle.rs:243 panic (插件线程 ExitThread 触发)
+        // 不调用 default_hook (会 abort 进程), 仅记录日志后继续运行
+        if payload.contains("threads should not terminate unexpectedly")
+            || loc.contains("lifecycle.rs")
+        {
+            eprintln!(
+                "[RUOO] 防御性截获 lifecycle panic ({}): {}",
+                loc, payload
+            );
+            // 写入专门日志
+            if let Ok(log_dir) = std::env::current_dir() {
+                let _ = std::fs::create_dir_all(log_dir.join("log"));
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log_dir.join("log").join("ruoo_lifecycle_panic.log"))
+                {
+                    use std::io::Write;
+                    let _ = writeln!(f, "[{}] {} | {}", ts, loc, payload);
+                }
+            }
+            // 不调用 default_hook — 进程继续运行
+            return;
         }
 
         // 调用默认 hook (打印到 stderr)
@@ -300,7 +331,7 @@ pub struct App {
     pub plugin_registry: Option<Arc<crate::plugin_registry::PluginRegistry>>,
     pub plugin_progress: Arc<crate::plugin_progress::MultiProgressManager>,
     pub message_broker: Arc<crate::message_broker::MessageBroker>,
-    pub plugin_mgr: crate::script::PluginManager,
+    pub plugin_mgr: std::sync::Arc<std::sync::Mutex<crate::script::PluginManager>>,
     /// v4.3: 字体大小 (Ctrl+滚轮调节)
     pub font_size: u32,
     /// IME 光标定位：UI 渲染时写入，draw() 后用 MoveTo+Hide 同批发送
@@ -440,7 +471,7 @@ impl App {
                 crate::message_broker::set_global_broker(broker.clone());
                 broker
             },
-            plugin_mgr: crate::script::PluginManager::new(),
+            plugin_mgr: crate::script::init_global_plugin_manager(),
             font_size,
             cursor_screen_pos: None,
             password_matrix_seed: 0xDEADBEEF_CAFE_BABE,
@@ -1272,69 +1303,31 @@ fn auto_load_plugins(app: &mut App) {
 
         app.push_output(&format!("  [·] 加载: {} ({})...", plugin_name, path_str));
 
-        match app.plugin_mgr.load(plugin_name, &path_str) {
+        let load_result = {
+            let mut mgr = app.plugin_mgr.lock().unwrap();
+            mgr.load(plugin_name, &path_str)
+        }; // MutexGuard在此释放
+
+        match load_result {
             Ok(msg) => {
                 app.push_output(&format!("    {}", msg));
                 loaded_count += 1;
 
-                // 注册命令 (App)
-                match app.plugin_mgr.get_library(plugin_name) {
-                    Some(lib) => {
-                        match crate::plugin::try_register_from_library(lib, plugin_name, &mut app.cmd_registry) {
-                            Ok(count) if count > 0 => {
-                                app.push_output(&format!("    [+] 已注册 {} 个命令", count));
-                                cmd_count += count as u32;
-                            }
-                            Ok(_) => {
-                                app.push_output("    [*] 无命令声明 (可用 plugin call 调用)");
-                            }
-                            Err(e) => {
-                                app.push_output(&format!("    [*] 命令探测: {}", e));
-                            }
-                        }
+                // 注册命令 v7.1: 临时加载DLL探测命令
+                match crate::plugin::try_register_from_file(&path_str, plugin_name, &mut app.cmd_registry) {
+                    Ok(count) if count > 0 => {
+                        app.push_output(&format!("    [+] 已注册 {} 个命令", count));
+                        cmd_count += count as u32;
                     }
-                    None => {
-                        app.push_output("    [!] 无法获取插件库引用");
+                    Ok(_) => {
+                        app.push_output("    [*] 无命令声明 (可用 plugin call 调用)");
+                    }
+                    Err(e) => {
+                        app.push_output(&format!("    [*] 命令探测: {}", e));
                     }
                 }
-
-                // ★ 同步到 AI 全局 PluginManager (GLOBAL_PLUGIN_MGR)
-                //    AI 的 plugin_list/plugin_call/plugin_load 使用独立管理器
-                //    此处将 App 已加载的插件 Arc 共享过去，避免重复加载 DLL
-                if let Some(info) = app.plugin_mgr.get_info(plugin_name) {
-                    let mut ai_guard = crate::ai::GLOBAL_PLUGIN_MGR.lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if ai_guard.is_none() {
-                        *ai_guard = Some(crate::script::PluginManager::new());
-                    }
-                    if let Some(ref mut ai_mgr) = *ai_guard {
-                        // 克隆 PluginInfo (Arc<Library> 引用计数+1，不重复加载 DLL)
-                        let cloned_info = crate::script::PluginInfo {
-                            lib: info.lib.clone(),
-                            path: info.path.clone(),
-                            permissions: info.permissions.clone(),
-                            last_modified: info.last_modified,
-                            version: info.version.clone(),
-                            crash_count: info.crash_count,
-                            faulted: info.faulted,
-                            circuit_breaker: crate::plugin::CircuitBreaker::new(10),
-                            abandoned_threads: Vec::new(),
-                        };
-                        ai_mgr.insert_info(plugin_name, cloned_info);
-
-                        // 同步注册命令到 AI 全局 CommandRegistry
-                        let mut ai_cmd_guard = crate::ai::GLOBAL_CMD_REGISTRY.lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        if ai_cmd_guard.is_none() {
-                            *ai_cmd_guard = Some(crate::plugin::CommandRegistry::new());
-                        }
-                        if let Some(ref mut ai_cmd) = *ai_cmd_guard {
-                            let _ = crate::plugin::try_register_from_library(
-                                info.lib.as_ref(), plugin_name, ai_cmd
-                            );
-                        }
-                    }
-                }
+                // v9.0: 全局 PluginManager 统一单例 — AI/TUI/脚本共享同一实例
+                //       无需同步, plugin_load 自动对全局生效
             }
             Err(e) => {
                 app.push_output(&format!("    [!] 加载失败: {}", e));
@@ -1384,10 +1377,10 @@ fn do_login(app: &mut App, password: &str) {
                     app.push_output("[+] 插件注册表已挂载");
 
                     // 自动加载注册表中的插件 (含命令注册)
-                    app.plugin_mgr.set_plugin_registry(reg_arc);
+                    app.plugin_mgr.lock().unwrap().set_plugin_registry(reg_arc);
         // v8.0: 设置全局 PluginManager 供 AI 统一命令池调度
-        crate::script::set_global_plugin_manager(&mut app.plugin_mgr);
-                    let load_results = app.plugin_mgr.auto_load_from_registry(&mut app.cmd_registry);
+        // v9.0: 全局 PluginManager 已在 init_global_plugin_manager() 初始化
+                    let load_results = app.plugin_mgr.lock().unwrap().auto_load_from_registry(&mut app.cmd_registry);
                     for msg in load_results {
                         app.push_output(&msg);
                     }
@@ -1441,9 +1434,9 @@ fn do_create_vault(app: &mut App, password: &str) -> Result<(), String> {
             app.plugin_registry = Some(reg_arc.clone());
             crate::ai::set_global_plugin_registry(reg_arc.clone());
             app.push_output("[+] 插件注册表已创建");
-            app.plugin_mgr.set_plugin_registry(reg_arc);
+            app.plugin_mgr.lock().unwrap().set_plugin_registry(reg_arc);
         // v8.0: 设置全局 PluginManager 供 AI 统一命令池调度
-        crate::script::set_global_plugin_manager(&mut app.plugin_mgr);
+        // v9.0: 全局 PluginManager 已在 init_global_plugin_manager() 初始化
             app.push_output("[*] 使用 plugin_reg 注册插件到加密数据库");
         }
         Err(e) => {
@@ -1762,11 +1755,25 @@ fn handle_editor_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
 
 // ── 主循环 ──
 fn main() -> io::Result<()> {
+    // v7.0: 子进程插件执行模式 — 在启动TUI前检测, 零开销旁路
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() >= 2 && args[1] == "--plugin-exec" {
+            crate::plugin_host::run_plugin_exec_mode(&args);
+        }
+    }
+
     // ═══ 防崩溃系统 — 必须在任何操作之前安装 ═══
     install_crash_defense();
-    
+    // v6.0: 安装 Windows VEH 原生崩溃捕获 — 防止插件 ACCESS_VIOLATION 杀死进程
+    panic_guard::native_crash::install();
+    // v4.6: 防御性 panic hook (处理 lifecycle.rs:243 等)
+    panic_guard::install_panic_hook();
 
-
+    // v4.3: 安装 Windows 原生崩溃捕获 (VEH — 捕获插件 DLL 的 SEGV/访问违规)
+    crate::panic_guard::native_crash::install();
+    // v4.6: 安装全局 panic hook 作为最后防线 (lifecycle.rs panic 截获)
+    crate::panic_guard::install_panic_hook();
 
     // Windows: 设置控制台为 UTF-8，解决中文乱码
     #[cfg(windows)]
@@ -1912,7 +1919,38 @@ fn main() -> io::Result<()> {
     while app.running {
         app.tick_count = app.tick_count.wrapping_add(1);
 
-        // ★ v4.2: 防御系统 — 已移除桩模块, 后台轮询不再需要
+        // ★ v4.5: 轮询插件native线程崩溃信号 — VEH捕获的崩溃在此处触发熔断/卸载
+        {
+            let signals = panic_guard::poll_native_crash_signals();
+            for sig in &signals {
+                let circuit_tag = if sig.exception_code == 0 { "[熔断]" } else { "[崩溃]" };
+                app.push_output(&format!(
+                    "{} 插件 '{}' native线程{}: {}",
+                    circuit_tag, sig.plugin_name, sig.thread_name, sig.crash_desc
+                ));
+                // 超过阈值: 自动 force_unload 崩溃插件
+                if panic_guard::is_plugin_native_crash_circuit(&sig.plugin_name) {
+                    let unload_msg = {
+                        let plugin_name = &sig.plugin_name;
+                        if let Ok(mut mgr) = app.plugin_mgr.lock() {
+                            match mgr.force_unload(plugin_name) {
+                                Ok(msg) => msg,
+                                Err(e) => format!("[!] 强制卸载失败: {}", e),
+                            }
+                        } else {
+                            format!("[!] 无法获取插件管理器锁")
+                        }
+                    };
+                    app.push_output(&format!(
+                        "[!] 插件 '{}' native线程累计崩溃超过阈值 — 自动强制卸载",
+                        sig.plugin_name
+                    ));
+                    app.push_output(&unload_msg);
+                    // 重置计数以便后续重新加载
+                    panic_guard::reset_plugin_native_crashes(&sig.plugin_name);
+                }
+            }
+        }
 
         // ★ v5.2: 轮询全局热键 — 桌面快捷键恢复窗口
         if let Some(ref flag) = app.window_show_requested {
@@ -2196,6 +2234,51 @@ fn main() -> io::Result<()> {
 
         // ★ v5.1: 排空消息代理 — 插件/后台线程消息注入输出
         app.message_broker.drain(&mut app.output);
+
+        // ★ v4.4: 轮询native崩溃信号 — VEH捕获的插件native线程崩溃
+        //   每tick (~150ms)检查, 发现熔断信号→自动force_unload
+        {
+            let crash_signals = crate::panic_guard::poll_native_crash_signals();
+            if !crash_signals.is_empty() {
+                for signal in &crash_signals {
+                    if signal.thread_name.starts_with("VEH_CIRCUIT_BREAKER") {
+                        // 熔断信号 — 自动强制卸载
+                        let plugin_name = signal.plugin_name.clone();
+                        let crash_desc = signal.crash_desc.clone();
+                        app.push_output(&format!(
+                            "[!] ═══ 插件熔断触发 ═══\n  \
+                             [!] 插件: {}\n  \
+                             [!] 原因: {}",
+                            plugin_name, crash_desc
+                        ));
+                        app.push_output("[!] 操作: 自动强制卸载");
+                        // 尝试force_unload — 在独立作用域中操作，确保MutexGuard释放
+                        let unload_result = {
+                            let mut mgr = app.plugin_mgr.lock().unwrap();
+                            mgr.force_unload(&plugin_name)
+                        };
+                        match unload_result {
+                            Ok(msg) => {
+                                app.push_output(&format!("[+] {}", msg));
+                                crate::panic_guard::reset_plugin_native_crashes(&plugin_name);
+                            }
+                            Err(e) => {
+                                app.push_output(&format!("[!] 强制卸载失败: {}", e));
+                            }
+                        }
+                    } else {
+                        // 普通native线程崩溃 — 警告
+                        app.push_output(&format!(
+                            "[!] 插件native线程崩溃: {} | 线程: {} | {} | {}",
+                            signal.plugin_name,
+                            signal.thread_name,
+                            signal.crash_desc,
+                            if signal.is_recoverable { "已恢复" } else { "不可恢复" }
+                        ));
+                    }
+                }
+            }
+        }
 
         // ★ v4.5: 渲染 — I/O错误不崩溃, 连续失败3次→terminal重置
         if let Err(e) = terminal.draw(|f| ui::ui(f, &mut app)) {

@@ -20,8 +20,8 @@ pub mod executor;     // execute_tool 工具调度
 pub use types::{AiPermLevel, StreamMsg, StreamKind};
 pub use types::{set_terminal_output, send_ai_message, send_ai_message_raw, set_ai_message_tx, set_ai_message_raw_tx};
 pub use session::AiSession;
-pub use globals::{trigger_tool_abort, with_global_cmd_registry, with_global_plugin_mgr_mut};
+pub use globals::{trigger_tool_abort, with_global_cmd_registry};
 pub use globals::{set_global_plugin_registry, with_app_plugin_registry};
 pub use cache::clear_all_cache;
 pub use permissions::validate_shell_command;
-pub(crate) use globals::{GLOBAL_PLUGIN_MGR, GLOBAL_CMD_REGISTRY};
+// v9.0: GLOBAL_CMD_REGISTRY used via global_cmd_registry() accessor

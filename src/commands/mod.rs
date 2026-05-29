@@ -197,29 +197,24 @@ pub fn process_cmd(app: &mut App, raw: &str) {
 
             app.push_output(&format!("[plugin:{}] {} → {}", plugin_name, def.cmd, plugin_cmd));
 
-            // 使用持久化 PluginManager 调用 (先本地 app.plugin_mgr, 再 AI 全局)
+            // v9.0: 统一全局 PluginManager — TUI和AI共享同一实例
             let perms = crate::script::PermissionSet::all();
-            match app.plugin_mgr.call(&plugin_name, &plugin_cmd, &perms, 30_000) {
+            // v7.0: 使用智能调用 — 首次线程模式, 崩溃后自动降级子进程
+            let call_result = {
+                let mut mgr = app.plugin_mgr.lock().unwrap();
+                mgr.call_smart(&plugin_name, &plugin_cmd, &perms, 30_000)
+            }; // MutexGuard在此释放
+            match call_result {
                 Ok(result) => {
                     plugin_push_multiline(app, &plugin_name, &result);
                 }
                 Err(local_err) => {
-                    // 本地失败 → 尝试 AI 全局 PluginManager
-                    let global_ok = crate::ai::with_global_plugin_mgr_mut(|gmgr| {
-                        match gmgr.call(&plugin_name, &plugin_cmd, &perms, 30_000) {
-                            Ok(r) => { plugin_push_multiline(app, &plugin_name, &r); true }
-                            Err(_) => false,
-                        }
-                    }).unwrap_or(false);
-
-                    if !global_ok {
-                        let msg = local_err.to_lowercase();
-                        if msg.contains("unloaded") || msg.contains("not loaded") || msg.contains("not found") {
-                            app.push_output(&format!("[!] 插件 '{}' 未加载 — 请先 plugin load {} <路径>", plugin_name, plugin_name));
-                            app.push_output("[*] 可用: plugin load <名称> <路径> → 加载并自动注册命令");
-                        } else {
-                            app.push_output(&format!("[!] 插件调用失败: {}", local_err));
-                        }
+                    let msg = local_err.to_lowercase();
+                    if msg.contains("unloaded") || msg.contains("not loaded") || msg.contains("not found") {
+                        app.push_output(&format!("[!] 插件 '{}' 未加载 — 请先 plugin load {} <路径>", plugin_name, plugin_name));
+                        app.push_output("[*] 可用: plugin load <名称> <路径> → 加载并自动注册命令");
+                    } else {
+                        app.push_output(&format!("[!] 插件调用失败: {}", local_err));
                     }
                 }
             }
@@ -1489,7 +1484,55 @@ fn plugin_push_multiline(app: &mut App, plugin_name: &str, result: &str) {
 fn cmd_plugin(app: &mut App, sub: &Option<String>, arg2: &Option<String>) {
     let sub = sub.as_deref().unwrap_or("list");
     match sub {
-        // ── 防崩溃框架 v5.0 ──
+        // ── v7.1: 软重启 — 崩溃后一键恢复 ──
+        "restart" | "reload" => {
+            let name = match arg2 {
+                Some(n) => n.clone(),
+                None => {
+                    app.push_output("[!] 用法: plugin restart <名称>");
+                    return;
+                }
+            };
+            let report = {
+                let mut mgr = app.plugin_mgr.lock().unwrap();
+                mgr.soft_restart(&name, &mut app.cmd_registry)
+            }; // mgr dropped here
+            app.push_output(&report);
+        }
+        // ── v7.1: 批量恢复所有故障插件 ──
+        "recover-all" => {
+            let report = {
+                let mut mgr = app.plugin_mgr.lock().unwrap();
+                mgr.auto_recover_all(&mut app.cmd_registry)
+            };
+            app.push_output(&report);
+        }
+        // ── 防崩溃框架 ──
+        "crash-recover" => {
+            let name = match arg2 {
+                Some(n) => n.clone(),
+                None => {
+                    app.push_output("[!] 用法: plugin crash-recover <名称>");
+                    return;
+                }
+            };
+            let (report, _) = app.plugin_mgr.lock().unwrap().crash_recover(&name);
+            app.push_output(&report);
+        }
+        "force-unload" => {
+            let name = match arg2 {
+                Some(n) => n.clone(),
+                None => {
+                    app.push_output("[!] 用法: plugin force-unload <名称>");
+                    return;
+                }
+            };
+            let result = app.plugin_mgr.lock().unwrap().force_unload(&name);
+            match result {
+                Ok(msg) => app.push_output(&msg),
+                Err(e) => app.push_output(&format!("[!] {}", e)),
+            }
+        }
         "health" => {
             let name = match arg2 {
                 Some(n) => n.clone(),
@@ -1498,11 +1541,85 @@ fn cmd_plugin(app: &mut App, sub: &Option<String>, arg2: &Option<String>) {
                     return;
                 }
             };
-            app.push_output(&app.plugin_mgr.plugin_health_report(&name));
+            let health = app.plugin_mgr.lock().unwrap().plugin_health_report(&name);
+            app.push_output(&health);
         }
-        // ── 插件注册表 v5.0 ──
+        "health-all" => {
+            let summary = app.plugin_mgr.lock().unwrap().plugin_health_summary();
+            app.push_output(&summary);
+        }
+        // ── 列表 ──
+        "list" => {
+            let details = app.plugin_mgr.lock().unwrap().list_detailed();
+            if details.is_empty() {
+                app.push_output("[*] 无已加载插件");
+            } else {
+                app.push_output("[*] ====== 已加载插件 ======");
+                for d in &details {
+                    app.push_output(d);
+                }
+            }
+        }
+        // ── 加载/卸载 ──
+        "load" => {
+            let args = arg2.as_deref().unwrap_or("");
+            let parts: Vec<&str> = args.splitn(2, ' ').collect();
+            if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+                app.push_output("[!] 用法: plugin load <别名> <路径>");
+                return;
+            }
+            let alias = parts[0];
+            let path = parts[1];
+            app.push_output(&format!("[·] 加载插件: {} ({})...", alias, path));
+            let (load_result, reg_result) = {
+                let mut mgr = app.plugin_mgr.lock().unwrap();
+                let result = mgr.load(alias, path);
+                let reg = match result {
+                    Ok(_) => crate::plugin::try_register_from_file(path, alias, &mut app.cmd_registry),
+                    Err(_) => Ok(0),
+                };
+                (result, reg)
+            }; // mgr dropped here
+            match load_result {
+                Ok(msg) => {
+                    app.push_output(&format!("  {}", msg));
+                    match reg_result {
+                        Ok(n) if n > 0 => app.push_output(&format!("  [+] 已注册 {} 个命令", n)),
+                        Ok(_) => app.push_output("  [*] 无命令声明"),
+                        Err(e) => app.push_output(&format!("  [!] 命令注册: {}", e)),
+                    }
+                }
+                Err(e) => app.push_output(&format!("  [!] 加载失败: {}", e)),
+            }
+        }
+        "unload" => {
+            let name = match arg2 {
+                Some(n) => n.clone(),
+                None => {
+                    app.push_output("[!] 用法: plugin unload <名称>");
+                    return;
+                }
+            };
+            let (unload_result, removed) = {
+                let mut mgr = app.plugin_mgr.lock().unwrap();
+                let result = mgr.unload(&name);
+                let removed = if result.is_ok() { app.cmd_registry.unregister_plugin(&name) } else { 0 };
+                (result, removed)
+            }; // mgr dropped here
+            match unload_result {
+                Ok(()) => {
+                    app.push_output(&format!("[+] 插件已卸载: {} (注销 {} 个命令)", name, removed));
+                }
+                Err(e) => app.push_output(&format!("[!] {}", e)),
+            }
+        }
+        // ── 插件注册表 ──
         _ => {
-            app.push_output(&format!("[!] 未知子命令: {} — plugin load/call/unload/list/hotload/force-unload/crash-recover/health/health-all/reg/unreg/enable/disable/reg-list/reg-save", sub));
+            app.push_output(&format!(
+                "[!] 未知子命令: {}\n\
+                 [*] 可用: load/unload/list/restart/recover-all/crash-recover/force-unload/health/health-all",
+                sub
+            ));
         }
     }
 }

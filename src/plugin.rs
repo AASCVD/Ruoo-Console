@@ -896,6 +896,22 @@ impl PluginManager {
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<String, String> {
                     let c_cmd = CString::new(&*cmd_owned).map_err(|e| format!("命令编码失败: {}", e))?;
+                    // v4.3.1: 统一VEH保护 — 所有插件FFI调用都走 enter/leave_protected_call
+                    if !crate::panic_guard::native_crash::enter_protected_call(&name_owned) {
+                        let (code, addr, desc) = crate::panic_guard::native_crash::crash_details();
+                        return Err(format!(
+                            "[原生崩溃] 插件 '{}' 触发硬件异常: {} (0x{:08X} at 0x{:016X})",
+                            name_owned, desc, code, addr
+                        ));
+                    }
+                    // RAII守卫: 确保leave在任何?/return/panic路径上都被调用
+                    struct VehGuard;
+                    impl Drop for VehGuard {
+                        fn drop(&mut self) {
+                            crate::panic_guard::native_crash::leave_protected_call();
+                        }
+                    }
+                    let _veh_guard = VehGuard;
                     unsafe {
                         let func = lib_for_thread.get::<unsafe extern "C" fn(*const c_char) -> *mut c_char>(b"ruoo_plugin_exec")
                             .map_err(|_| "插件未导出 ruoo_plugin_exec".to_string())?;
@@ -904,12 +920,8 @@ impl PluginManager {
                             return Ok("(插件返回空)".to_string());
                         }
                         let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
-                        // v6.3: 始终尝试释放; 若free_func不存在则记录泄漏警告
                         if let Ok(free_func) = lib_for_thread.get::<unsafe extern "C" fn(*mut c_char)>(b"ruoo_plugin_free_result") {
                             free_func(ptr);
-                        } else {
-                            // 回退: 尝试通过已知导出名释放
-                            // 注意: 无法释放时内存将泄漏, 但插件DLL卸载时OS会回收
                         }
                         Ok(s)
                     }

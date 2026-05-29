@@ -1,10 +1,15 @@
 // ============================================================
-// RUOO-CONSOLE v5.0 — 插件防崩溃框架 (Plugin Crash Guard)
+// RUOO-CONSOLE v6.0 — 插件防崩溃框架 (Plugin Crash Guard)
 //
-// 防止插件致命性崩溃把终端搞崩.
-// 三层隔离: panic捕获 → 线程超时强杀 → 库强制卸载
+// v6.0 变更 (Zero-Day):
+//   - 四级隔离: native_crash::enter_protected_call (SEH+VEH+longjmp)
+//               → catch_unwind (Rust panic)
+//               → 独立线程边界
+//               → 熔断器
+//   - ACCESS_VIOLATION 等硬件异常不再穿透到进程级别
+//   - 使用 panic_guard::native_crash 的 VEH + setjmp/longjmp 基础设施
 //
-// 特性:
+// v5.0 特性:
 //   - PluginCallGuard: 全隔离调用, panic不传播到主线程
 //   - CrashReport: 详细崩溃诊断 (位置/原因/堆栈/建议)
 //   - force_unload: 强制卸载 (跳过shutdown, 直接drop+反复GC)
@@ -15,47 +20,37 @@
 use std::time::{Duration, Instant};
 use std::panic::{catch_unwind, AssertUnwindSafe, UnwindSafe};
 
+// ── v6.0: 线程内崩溃信号 (panic vs 硬件异常) ──
+enum ThreadCrashSignal {
+    Panic(String),
+    Hardware { code: u32, addr: usize, msg: String },
+}
+
 // ═══════════════════════════════════════════════════════
 // 崩溃报告
 // ═══════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CrashReport {
-    /// 插件名称
     pub plugin_name: String,
-    /// 插件版本
     pub plugin_version: String,
-    /// 插件路径
     pub plugin_path: String,
-    /// 崩溃时间 (ISO 8601)
     pub crashed_at: String,
-    /// 崩溃类型
     pub crash_type: CrashType,
-    /// 错误消息 (截断至500字符)
     pub error_message: String,
-    /// 调用命令
     pub command: String,
-    /// 崩溃时的堆栈 (前20帧)
     pub stack_trace: Vec<String>,
-    /// 建议操作
     pub suggested_action: String,
-    /// 是否已强制卸载
     pub was_force_unloaded: bool,
-    /// 该插件累计崩溃次数
     pub total_crashes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CrashType {
-    /// Rust panic (被 catch_unwind 捕获)
     Panic,
-    /// 调用超时 (插件线程超时被放弃)
     Timeout,
-    /// 调用后 SIGSEGV/访问冲突 (主进程捕获)
     Segfault,
-    /// 插件返回错误码
     ErrorCode(i32),
-    /// 未知致命错误
     Unknown,
 }
 
@@ -126,7 +121,6 @@ impl CrashReport {
         }
     }
 
-    /// 格式化完整崩溃报告
     pub fn format_report(&self) -> String {
         let mut r = String::new();
         r.push_str("═══ 插件崩溃报告 ═══\n");
@@ -200,11 +194,6 @@ pub fn persist_crash_log(report: &CrashReport) {
 // 防崩溃调用守卫
 // ═══════════════════════════════════════════════════════
 
-/// 插件调用守卫 — 完全隔离插件崩溃
-/// 
-/// 使用方式:
-///   let guard = PluginCallGuard::new("myplug", "1.0", "/path/to/plug.dll", "scan");
-///   let result = guard.call_with_timeout(|| unsafe { plugin_exec(cmd) }, 30_000);
 pub struct PluginCallGuard {
     pub plugin_name: String,
     pub plugin_version: String,
@@ -224,8 +213,13 @@ impl PluginCallGuard {
         }
     }
 
-    /// 带超时的安全调用 — panic被捕获, 超时被检测
-    /// 返回: Ok(result) 或 Err(CrashReport)
+    /// v6.0: 四级隔离安全调用
+    ///
+    /// Layer 1: native_crash::enter_protected_call — SEH (VEH+setjmp/longjmp)
+    ///          捕获 ACCESS_VIOLATION/ILLEGAL_INSTRUCTION 等硬件异常
+    /// Layer 2: catch_unwind — 捕获 Rust panic
+    /// Layer 3: 独立线程 — 崩溃不传播到主线程
+    /// Layer 4: 熔断器 — 连续崩溃自动禁用
     pub fn call_with_timeout<F, R>(
         &self,
         f: F,
@@ -236,6 +230,8 @@ impl PluginCallGuard {
         R: Send + 'static,
     {
         let name = self.plugin_name.clone();
+        let name_thread = name.clone();
+        let name_closure = name.clone();
         let ver = self.plugin_version.clone();
         let path = self.plugin_path.clone();
         let cmd = self.command.clone();
@@ -245,11 +241,24 @@ impl PluginCallGuard {
         let start = Instant::now();
         let deadline = start + timeout;
 
-        // 在独立线程中执行, panic不传播
         let handle = match std::thread::Builder::new()
-            .name(format!("plug-{}", &name[..name.len().min(16)]))
-            .spawn(move || {
-                catch_unwind(AssertUnwindSafe(f))
+            .name(format!("plug-{}", &name_thread[..name_thread.len().min(16)]))
+            .spawn(move || -> Result<R, ThreadCrashSignal> {
+                // Layer 1: SEH — 捕获 ACCESS_VIOLATION 等硬件异常
+                if !crate::panic_guard::native_crash::enter_protected_call(&name_closure) {
+                    let (_code, _addr, msg) = crate::panic_guard::native_crash::crash_details();
+                    return Err(ThreadCrashSignal::Hardware { code: _code, addr: _addr, msg });
+                }
+
+                // Layer 2: catch_unwind — 捕获 Rust panic
+                let result = catch_unwind(AssertUnwindSafe(|| f()));
+
+                crate::panic_guard::native_crash::leave_protected_call();
+
+                match result {
+                    Ok(val) => Ok(val),
+                    Err(e) => Err(ThreadCrashSignal::Panic(extract_panic_message(&e))),
+                }
             })
         {
             Ok(h) => h,
@@ -271,20 +280,25 @@ impl PluginCallGuard {
             if handle.is_finished() {
                 match handle.join() {
                     Ok(Ok(result)) => return Ok(result),
-                    Ok(Err(panic_info)) => {
-                        let msg = extract_panic_message(&panic_info);
-                        let crash_type = if msg.contains("SIGSEGV") || msg.contains("access violation") {
-                            CrashType::Segfault
-                        } else {
-                            CrashType::Panic
-                        };
+
+                    Ok(Err(ThreadCrashSignal::Panic(msg))) => {
                         let report = CrashReport::new(
                             &name, &ver, &path,
-                            crash_type, &msg, &cmd, crashes, false,
+                            CrashType::Panic, &msg, &cmd, crashes, false,
                         );
                         persist_crash_log(&report);
                         return Err(report);
                     }
+
+                    Ok(Err(ThreadCrashSignal::Hardware { code: _c, addr: _a, msg })) => {
+                        let report = CrashReport::new(
+                            &name, &ver, &path,
+                            CrashType::Segfault, &msg, &cmd, crashes, false,
+                        );
+                        persist_crash_log(&report);
+                        return Err(report);
+                    }
+
                     Err(_) => {
                         let report = CrashReport::new(
                             &name, &ver, &path,
@@ -299,10 +313,7 @@ impl PluginCallGuard {
             }
 
             if Instant::now() >= deadline {
-                // 超时 — 线程仍在运行, 显式detach避免句柄泄漏
-                // Rust无法安全终止线程, 只能detach让OS在线程结束后回收
-                // 注意: DLL仍被Arc引用保持加载, 线程可能继续持有资源
-                std::mem::forget(handle); // 不join, 直接丢弃JoinHandle
+                std::mem::forget(handle);
                 let elapsed = start.elapsed().as_millis() as u64;
                 let report = CrashReport::new(
                     &name, &ver, &path,
@@ -318,7 +329,7 @@ impl PluginCallGuard {
         }
     }
 
-    /// 同步安全调用 (无超时)
+    /// 同步安全调用 (无超时, 无SEH — 仅在独立线程中调用时使用)
     pub fn call_safe<F, R>(&self, f: F) -> Result<R, CrashReport>
     where
         F: FnOnce() -> R + UnwindSafe,
@@ -333,14 +344,9 @@ impl PluginCallGuard {
             Ok(result) => Ok(result),
             Err(panic_info) => {
                 let msg = extract_panic_message(&panic_info);
-                let crash_type = if msg.contains("SIGSEGV") || msg.contains("access violation") {
-                    CrashType::Segfault
-                } else {
-                    CrashType::Panic
-                };
                 let report = CrashReport::new(
                     name, ver, path,
-                    crash_type, &msg, cmd, crashes, false,
+                    CrashType::Panic, &msg, cmd, crashes, false,
                 );
                 persist_crash_log(&report);
                 Err(report)
@@ -357,8 +363,6 @@ pub fn extract_panic_message(panic_info: &Box<dyn std::any::Any + Send>) -> Stri
     if let Some(s) = panic_info.downcast_ref::<String>() {
         s.chars().take(500).collect()
     } else if let Some(s) = panic_info.downcast_ref::<&str>() {
-        s.chars().take(500).collect()
-    } else if let Some(s) = panic_info.downcast_ref::<std::string::String>() {
         s.chars().take(500).collect()
     } else {
         "(无法读取panic负载 — 非字符串类型)".to_string()
@@ -377,8 +381,7 @@ mod tests {
     fn test_crash_report_format() {
         let report = CrashReport::new(
             "test_plug", "1.0.0", "/tmp/test.dll",
-            CrashType::Panic, "index out of bounds: the len is 0 but the index is 1",
-            "scan --ports 80", 1, true,
+            CrashType::Panic, "index out of bounds", "scan --ports 80", 1, true,
         );
         let formatted = report.format_report();
         assert!(formatted.contains("PANIC"));
@@ -409,11 +412,8 @@ mod tests {
     fn test_call_guard_timeout() {
         let guard = PluginCallGuard::new("test", "1.0", "/t/t.dll", "sleep", 0);
         let result = guard.call_with_timeout(
-            || {
-                std::thread::sleep(Duration::from_secs(10));
-                42
-            },
-            100, // 100ms timeout
+            || { std::thread::sleep(Duration::from_secs(10)); 42 },
+            100,
         );
         assert!(result.is_err());
         let report = result.unwrap_err();

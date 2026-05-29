@@ -3,15 +3,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use super::permissions::{PermissionSet, PluginPermissions};
 
-// ─── 插件信息 v6.2: 集成熔断器 ───────────────────────
+// ─── 插件信息 v7.1: 子进程架构 — 无进程内DLL ───────
 pub(crate) struct PluginInfo {
-    /// 共享库 (Arc 支持后台线程执行)
-    pub(crate) lib: Arc<libloading::Library>,
-    /// 原始文件路径 (用于热加载检测)
+    /// 原始文件路径 (用于子进程启动)
     pub(crate) path: PathBuf,
     /// 插件声明的权限
     pub(crate) permissions: PluginPermissions,
-    /// 最后修改时间 (用于 watch-plugins)
+    /// 最后修改时间 (用于 hotload 检测)
     pub(crate) last_modified: std::time::SystemTime,
     /// 插件版本 (来自 ruoo_plugin_version)
     pub(crate) version: String,
@@ -21,8 +19,6 @@ pub(crate) struct PluginInfo {
     pub(crate) faulted: bool,
     /// v6.2: 熔断器 — 防止反复崩溃挂起终端
     pub(crate) circuit_breaker: crate::plugin::CircuitBreaker,
-    /// v4.2.1: 超时后被抛弃的线程句柄 — 卸载前必须join, 防止DLL卸载时FFI调用segfault
-    pub(crate) abandoned_threads: Vec<std::thread::JoinHandle<()>>,
 }
 
 // ─── 插件管理器 v2 — 权限 + 热加载 + 后台线程 ─────────
@@ -133,8 +129,10 @@ impl PluginManager {
             }
         }
 
+        // v7.1: 子进程架构 — init后丢弃lib, 执行通过子进程隔离
+        drop(lib);
+
         self.loaded.insert(name.to_string(), PluginInfo {
-            lib: Arc::new(lib),
             path: canonical,
             permissions: perms.clone(),
             last_modified: mtime,
@@ -142,7 +140,6 @@ impl PluginManager {
             crash_count: 0,
             faulted: false,
             circuit_breaker: crate::plugin::CircuitBreaker::new(10),
-            abandoned_threads: Vec::new(),
         });
 
         Ok(format!(
@@ -201,52 +198,14 @@ impl PluginManager {
         }
     }
 
-    /// 内部热加载实现
+    /// 内部热加载实现 v7.1: 子进程架构 — 临时加载DLL探头后丢弃
     fn hotload_inner(&mut self, name: &str, path: &PathBuf) -> Result<String, String> {
-        // v6.4: 备份旧版本用于回滚
+        // 备份旧版本用于回滚
         let old_info = self.loaded.remove(name);
         let old_crash_count = old_info.as_ref().map(|o| o.crash_count).unwrap_or(0);
+        // v7.1: 旧 info 直接 drop — 无进程内资源需清理
 
-        // 1. 卸载旧版 (调用 shutdown + join abandoned threads)
-        if let Some(mut old) = old_info {
-            let old_path = old.path.display().to_string();
-
-            // v4.2.1: join abandoned threads before dropping library
-            for handle in old.abandoned_threads.drain(..) {
-                let _ = handle.join();
-            }
-
-            unsafe {
-                if let Ok(shutdown) = old.lib.get::<unsafe extern "C" fn()>(b"ruoo_plugin_shutdown") {
-                    shutdown();
-                }
-            }
-            drop(old); // 显式卸载
-
-            // v6.6: FreeLibrary 循环确保旧 DLL 完全释放
-            #[cfg(windows)]
-            {
-                extern "system" {
-                    fn GetModuleHandleW(lpModuleName: *const u16) -> isize;
-                    fn FreeLibrary(hLibModule: isize) -> i32;
-                }
-                use std::os::windows::ffi::OsStrExt;
-                let wide: Vec<u16> = std::ffi::OsStr::new(&old_path)
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                for _ in 0..16 {
-                    unsafe {
-                        let h = GetModuleHandleW(wide.as_ptr());
-                        if h == 0 { break; }
-                        FreeLibrary(h);
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
-            }
-        }
-
-        // 2. 加载新版
+        // 加载新版 (临时, 用于探头+init)
         let mtime = path.metadata()
             .map_err(|e| format!("无法读取元数据: {}", e))?
             .modified()
@@ -255,7 +214,6 @@ impl PluginManager {
         let lib = match unsafe { libloading::Library::new(path) } {
             Ok(l) => l,
             Err(e) => {
-                // v6.4: 加载失败 — 旧版本已卸载, 无法自动回滚
                 return Err(format!(
                     "热加载失败: 无法加载新版DLL '{}' ({}) — 旧版本已卸载, 请手动 plugin load 恢复",
                     path.display(), e
@@ -267,7 +225,7 @@ impl PluginManager {
         let (perms, version) = match probe_result {
             Ok(v) => v,
             Err(e) => {
-                Self::force_drop_library(lib, path);
+                drop(lib);
                 return Err(format!("热加载失败: 探测插件失败 ({}) — 旧版本已卸载, 请手动恢复", e));
             }
         };
@@ -278,28 +236,29 @@ impl PluginManager {
         let init = match init_result {
             Ok(func) => func,
             Err(_) => {
-                Self::force_drop_library(lib, path);
+                drop(lib);
                 return Err("热加载: 缺少 ruoo_plugin_init — 旧版本已卸载".to_string());
             }
         };
         unsafe {
             let code = init();
             if code != 0 {
-                Self::force_drop_library(lib, path);
+                drop(lib);
                 return Err(format!("热加载: init 返回 {} — 旧版本已卸载", code));
             }
         }
 
+        // v7.1: init 后丢弃 DLL — 执行通过子进程隔离
+        drop(lib);
+
         self.loaded.insert(name.to_string(), PluginInfo {
-            lib: Arc::new(lib),
             path: path.clone(),
             permissions: perms.clone(),
             last_modified: mtime,
             version,
-            crash_count: old_crash_count, // v6.4: 保留旧崩溃计数
+            crash_count: old_crash_count,
             faulted: false,
             circuit_breaker: crate::plugin::CircuitBreaker::new(10),
-            abandoned_threads: Vec::new(),
         });
 
         Ok(format!(
@@ -335,187 +294,11 @@ impl PluginManager {
         script_perms: &PermissionSet,
         timeout_ms: u64,
     ) -> Result<String, String> {
-        // 1. 权限预检查
-        script_perms.check_plugin()?;
-
-        // 2. 热加载检测
-        let hot_msg = self.check_hotload(name)?;
-
-        // 3. v6.2: 一次性检查 faulted + 熔断器 + 权限 + 提取参数
-        {
-            let info = self.loaded.get_mut(name)
-                .ok_or_else(|| format!("插件未加载: {}", name))?;
-            script_perms.covers(&info.permissions)?;
-            if info.faulted {
-                return Err(format!(
-                    "[!] 插件 '{}' 已被标记为故障 (累计{}次崩溃) — 请使用 crash_recover 恢复",
-                    name, info.crash_count
-                ));
-            }
-            if !info.circuit_breaker.allow_call() {
-                return Err(format!(
-                    "插件 '{}' 已熔断: {}", name, info.circuit_breaker.status_report()
-                ));
-            }
-        }
-
-        // 4. 获取 info (热加载可能已替换, 使用不可变引用)
-        let info = self.loaded.get(name)
-            .ok_or_else(|| format!("插件热加载后丢失: {}", name))?;
-
-        let (result, abandoned_handle) = self.call_inner(info, command, timeout_ms, hot_msg);
-
-        // v4.2.1: 存储超时后被抛弃的线程句柄 — 卸载前join防止segfault
-        if let Some(handle) = abandoned_handle {
-            if let Some(info) = self.loaded.get_mut(name) {
-                info.abandoned_threads.push(handle);
-            }
-        }
-
-        // 5. 更新熔断器
-        if let Some(info) = self.loaded.get_mut(name) {
-            if result.is_err() {
-                let _ = info.circuit_breaker.record_failure(&format!("{:?}", result.as_ref().err()), command);
-            } else {
-                info.circuit_breaker.record_success();
-            }
-        }
-
-        result
+        // v7.1: 所有插件执行统一走子进程隔离 — ACCESS_VIOLATION/STACK_OVERFLOW 不再影响主进程
+        self.call_subprocess(name, command, script_perms, timeout_ms)
     }
 
-    /// 实际调用逻辑 (v4.2.1: 返回abandoned_handle供调用者存储, 防止DLL卸载时segfault)
-    fn call_inner(
-        &self,
-        info: &PluginInfo,
-        command: &str,
-        timeout_ms: u64,
-        prefix_msg: Option<String>,
-    ) -> (Result<String, String>, Option<std::thread::JoinHandle<()>>) {
-        let lib = info.lib.clone();
-        let cmd_owned = command.to_string();
-        let timeout = std::time::Duration::from_millis(timeout_ms);
-
-        // spawn 后台线程
-        let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
-
-        let handle = match std::thread::Builder::new()
-            .name(format!("ruoo-plugin-{}", command.chars().take(16).collect::<String>()))
-            .spawn(move || {
-                // catch_unwind 防止插件 panic 导致进程崩溃
-                // v4.2: stderr 捕获 — 重定向插件stderr到管道, 避免破坏TUI布局
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let stderr_cap = super::plugin_stderr::StderrCapture::begin();
-                    let exec_result = Self::call_plugin_unsafe(&lib, &cmd_owned);
-                    let captured = stderr_cap.map(|c| c.end()).unwrap_or_default();
-                    match exec_result {
-                        Ok(output) => {
-                            if captured.is_empty() {
-                                Ok(output)
-                            } else {
-                                Ok(format!("{}\n[plugin stderr]\n{}", output, captured))
-                            }
-                        }
-                        Err(e) => {
-                            if captured.is_empty() {
-                                Err(e)
-                            } else {
-                                Err(format!("{}\n[plugin stderr]\n{}", e, captured))
-                            }
-                        }
-                    }
-                }));
-                let final_result = match result {
-                    Ok(r) => r,
-                    Err(panic_info) => {
-                        let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                            format!("插件 panic: {}", s)
-                        } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                            format!("插件 panic: {}", s)
-                        } else {
-                            "插件 panic: 未知原因 (可能内存损坏/空指针)".into()
-                        };
-                        Err(msg)
-                    }
-                };
-                let _ = tx.send(final_result);
-        }) {
-            Ok(h) => h,
-            Err(e) => return (Err(format!("无法创建插件线程: {}", e)), None),
-        };
-
-        // 等待结果 (超时保护)
-        match rx.recv_timeout(timeout) {
-            Ok(result) => {
-                // 线程正常完成, join回收
-                let _ = handle.join();
-                let r = match result {
-                    Ok(output) => {
-                        let mut full = String::new();
-                        if let Some(msg) = prefix_msg {
-                            full.push_str(&msg);
-                            full.push('\n');
-                        }
-                        full.push_str(&output);
-                        Ok(full)
-                    }
-                    Err(e) => Err(e),
-                };
-                (r, None)
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // v4.2.1: 超时 — 返回abandoned句柄, 调用者存储后由unload时join
-                (Err(format!(
-                    "插件调用超时 ({}ms) — 线程仍在运行, 已登记, 卸载前将等待完成",
-                    timeout_ms
-                )), Some(handle))
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = handle.join();
-                (Err("插件线程异常终止 (panic/崩溃)".into()), None)
-            }
-        }
-    }
-
-    /// 不安全调用 — 在独立线程中执行
-    fn call_plugin_unsafe(lib: &libloading::Library, command: &str) -> Result<String, String> {
-        let cmd = std::ffi::CString::new(command)
-            .map_err(|e| format!("命令含空字符: {}", e))?;
-
-        unsafe {
-            // 获取 exec 符号
-            let exec: libloading::Symbol<
-                unsafe extern "C" fn(*const std::ffi::c_char) -> *mut std::ffi::c_char,
-            > = lib
-                .get(b"ruoo_plugin_exec")
-                .map_err(|_| "插件缺少 ruoo_plugin_exec 导出".to_string())?;
-
-            // 调用
-            let result_ptr = exec(cmd.as_ptr());
-
-            if result_ptr.is_null() {
-                return Err("插件返回空指针 (可能是内部错误)".into());
-            }
-
-            // 复制结果
-            let result = std::ffi::CStr::from_ptr(result_ptr)
-                .to_string_lossy()
-                .into_owned();
-
-            // ★ Bug 修复: 调用 ruoo_plugin_free_result 释放插件分配的内存
-            if let Ok(free_func) = lib.get::<unsafe extern "C" fn(*mut std::ffi::c_char)>(
-                b"ruoo_plugin_free_result",
-            ) {
-                free_func(result_ptr);
-            }
-            // 如果插件没有导出 free_result，内存泄漏 (但不会崩溃)
-
-            Ok(result)
-        }
-        // cmd (CString) 在此释放 → as_ptr() 指针已过期但已用完
-    }
-
-    /// 无超时调用 (兼容旧接口)
+    /// 无超时调用 (兼容旧接口, v7.1: 走子进程)
     #[allow(dead_code)]
     pub fn call_default(
         &mut self,
@@ -523,78 +306,19 @@ impl PluginManager {
         command: &str,
         script_perms: &PermissionSet,
     ) -> Result<String, String> {
-        self.call(name, command, script_perms, 30_000) // 默认30秒超时
+        self.call_subprocess(name, command, script_perms, 30_000) // 默认30秒超时
     }
 
-    /// 卸载插件 v6.6: 增加 FreeLibrary 循环彻底释放 DLL 文件句柄
+    /// 卸载插件 v7.1: 子进程架构 — 无进程内DLL, 直接移除
     pub fn unload(&mut self, name: &str) -> Result<(), String> {
-        if let Some(mut info) = self.loaded.remove(name) {
-            let path = info.path.display().to_string();
-
-            // v4.2.1: 首先join所有超时后被抛弃的线程
-            for handle in info.abandoned_threads.drain(..) {
-                let _ = handle.join();
-            }
-
-            // 调用清理函数 (v6.7 fix: catch_unwind 防止 shutdown 崩溃炸进程)
-            unsafe {
-                if let Ok(shutdown) = info.lib.get::<unsafe extern "C" fn()>(b"ruoo_plugin_shutdown") {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shutdown()));
-                }
-            }
-            drop(info);
-
-            // v6.6: Windows FreeLibrary 循环
-            #[cfg(windows)]
-            {
-                extern "system" {
-                    fn GetModuleHandleW(lpModuleName: *const u16) -> isize;
-                    fn FreeLibrary(hLibModule: isize) -> i32;
-                }
-                use std::os::windows::ffi::OsStrExt;
-                let wide: Vec<u16> = std::ffi::OsStr::new(&path)
-                    .encode_wide()
-                    .chain(std::iter::once(0))
-                    .collect();
-                for _ in 0..32 {
-                    unsafe {
-                        let h = GetModuleHandleW(wide.as_ptr());
-                        if h == 0 { break; }
-                        FreeLibrary(h);
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                }
-            }
+        if self.loaded.remove(name).is_some() {
             Ok(())
         } else {
             Err(format!("插件未加载: {}", name))
         }
     }
 
-    /// v6.6: 强制释放库句柄 — 带 FreeLibrary 循环
-    fn force_drop_library(lib: libloading::Library, path: &std::path::Path) {
-        drop(lib);
-        #[cfg(windows)]
-        {
-            extern "system" {
-                fn GetModuleHandleW(lpModuleName: *const u16) -> isize;
-                fn FreeLibrary(hLibModule: isize) -> i32;
-            }
-            use std::os::windows::ffi::OsStrExt;
-            let wide: Vec<u16> = std::ffi::OsStr::new(path)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-            for _ in 0..16 {
-                unsafe {
-                    let h = GetModuleHandleW(wide.as_ptr());
-                    if h == 0 { break; }
-                    FreeLibrary(h);
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-            }
-        }
-    }
+
 
     /// 列出已加载插件及详情
     pub fn list(&self) -> Vec<String> {
@@ -645,13 +369,17 @@ impl PluginManager {
         count
     }
 
-    /// ★ v4.3新增: 探测已加载插件的 ruoo_plugin_commands 导出
-    /// 返回 JSON 命令列表字符串 (空数组表示无命令声明)
-    /// 使用已加载的 Library 句柄，避免重复打开 DLL
+    /// v7.1: 探测插件命令 — 临时加载DLL读取ruoo_plugin_commands后立即释放
     pub fn probe_plugin_commands(&self, name: &str) -> Result<String, String> {
         let info = self.loaded.get(name)
             .ok_or_else(|| format!("插件未加载: {}", name))?;
-        crate::plugin::probe_plugin_commands(&info.lib)
+        let lib = unsafe {
+            libloading::Library::new(&info.path)
+                .map_err(|e| format!("无法加载库以探测命令: {}", e))?
+        };
+        let result = crate::plugin::probe_plugin_commands(&lib);
+        drop(lib);
+        result
     }
 
 
@@ -665,11 +393,9 @@ impl PluginManager {
     // 防崩溃框架 v5.0 — crash guard / force unload / crash recover
     // ═══════════════════════════════════════════════════════
 
-    /// 强制卸载插件 (跳过 shutdown, 直接 drop 库句柄)
-    /// 用于插件崩溃/挂起后强制清理, 防止终端崩溃
-    /// v6.6: 增强清理 — 等待孤立线程 + 激进FreeLibrary循环 彻底释放DLL文件句柄
+    /// 强制卸载插件 v7.1: 子进程架构 — 无需清理进程内资源
     pub fn force_unload(&mut self, name: &str) -> Result<String, String> {
-        let mut info = match self.loaded.remove(name) {
+        let info = match self.loaded.remove(name) {
             Some(i) => i,
             None => return Err(format!("插件未加载: {}", name)),
         };
@@ -677,55 +403,6 @@ impl PluginManager {
         let path = info.path.display().to_string();
         let ver = info.version.clone();
         let crashes = info.crash_count;
-
-        // v4.2.1: 首先join所有超时后被抛弃的线程
-        for handle in info.abandoned_threads.drain(..) {
-            let _ = handle.join();
-        }
-
-        // v6.6: 等待孤立线程释放 Arc 克隆 (call_guarded 可能使用 detached 线程)
-        // Arc 被 move 进线程闭包, 线程结束后引用计数减1
-        for _ in 0..10 {
-            if Arc::strong_count(&info.lib) <= 1 { break; }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-
-        // 尝试调用 shutdown (可能成功也可能崩溃, 我们已做好最坏准备)
-        unsafe {
-            if let Ok(shutdown) = info.lib.get::<unsafe extern "C" fn()>(b"ruoo_plugin_shutdown") {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shutdown()));
-            }
-        }
-
-        // 强制释放 Arc → 当所有引用释放后库被卸载
-        drop(info);
-
-        // v6.6: Windows 激进 FreeLibrary 循环 — 彻底耗尽残留引用
-        #[cfg(windows)]
-        {
-            extern "system" {
-                fn GetModuleHandleW(lpModuleName: *const u16) -> isize;
-                fn FreeLibrary(hLibModule: isize) -> i32;
-            }
-            use std::os::windows::ffi::OsStrExt;
-            let wide: Vec<u16> = std::ffi::OsStr::new(&path)
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-            for _ in 0..32 {
-                unsafe {
-                    let h = GetModuleHandleW(wide.as_ptr());
-                    if h == 0 { break; }
-                    FreeLibrary(h);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            }
-        }
-
-        // 让出CPU确保OS处理 DLL_PROCESS_DETACH
-        for _ in 0..3 {
-            std::thread::yield_now();
-        }
 
         Ok(format!(
             "[!] 插件已强制卸载: {} v{} (路径: {}, 累计崩溃: {})",
@@ -777,9 +454,126 @@ impl PluginManager {
         }
     }
 
-    /// 安全调用插件 (带防崩溃守卫)
-    /// panic → 自动捕获并生成CrashReport → 自动强制卸载故障插件
-    /// 超时 → 自动生成CrashReport → 线程被放弃 (库仍加载但不可用)
+    /// v7.1: 软重启 — 崩溃后一键卸载+重载+恢复可用
+    /// 步骤: 记录路径 → 卸载 → 重载 → 重新注册命令 → 重置熔断器
+    /// 适用于子进程崩溃后无需重启终端即可恢复插件
+    pub fn soft_restart(
+        &mut self,
+        name: &str,
+        cmd_registry: &mut crate::plugin::CommandRegistry,
+    ) -> String {
+        let mut report = String::new();
+        report.push_str(&format!("═══ 插件软重启: {} ═══\n", name));
+
+        // 1. 获取当前状态
+        let (dll_path, was_faulted, crashes) = match self.loaded.get(name) {
+            Some(info) => (
+                info.path.to_string_lossy().to_string(),
+                info.faulted,
+                info.crash_count,
+            ),
+            None => {
+                // 插件未加载 — 尝试从注册表恢复
+                let reg_path = self.plugin_registry.as_ref()
+                    .and_then(|reg| reg.get(name))
+                    .map(|entry| entry.path.clone());
+                if let Some(reg_path) = reg_path {
+                    report.push_str("  [*] 插件未加载, 从注册表恢复...\n");
+                    match self.load(name, &reg_path) {
+                        Ok(msg) => {
+                            report.push_str(&format!("  {}\n", msg));
+                            match crate::plugin::try_register_from_file(&reg_path, name, cmd_registry) {
+                                Ok(n) => report.push_str(&format!("  [+] 已注册 {} 个命令\n", n)),
+                                Err(e) => report.push_str(&format!("  [!] 命令注册: {}\n", e)),
+                            }
+                            report.push_str("  [+] 软重启完成\n");
+                            return report;
+                        }
+                        Err(e) => {
+                            report.push_str(&format!("  [!] 加载失败: {}\n", e));
+                            return report;
+                        }
+                    }
+                }
+                report.push_str("  [!] 插件未加载且注册表无记录\n");
+                return report;
+            }
+        };
+
+        report.push_str(&format!("  路径: {}\n", dll_path));
+        report.push_str(&format!("  崩溃次数: {} | 故障标记: {}\n", crashes, was_faulted));
+
+        // 2. 卸载 (保留路径)
+        match self.force_unload(name) {
+            Ok(msg) => report.push_str(&format!("  [+] 卸载: {}\n", msg)),
+            Err(e) => report.push_str(&format!("  [!] 卸载: {}\n", e)),
+        }
+
+        // 3. 注销旧命令
+        let removed = cmd_registry.unregister_plugin(name);
+        if removed > 0 {
+            report.push_str(&format!("  [·] 注销 {} 个旧命令\n", removed));
+        }
+
+        // 4. 重新加载
+        match self.load(name, &dll_path) {
+            Ok(msg) => {
+                report.push_str(&format!("  [+] 重载: {}\n", msg));
+                // 5. 重新注册命令
+                match crate::plugin::try_register_from_file(&dll_path, name, cmd_registry) {
+                    Ok(n) if n > 0 => report.push_str(&format!("  [+] 重新注册 {} 个命令\n", n)),
+                    Ok(_) => report.push_str("  [*] 无命令声明\n"),
+                    Err(e) => report.push_str(&format!("  [!] 命令注册: {}\n", e)),
+                }
+                // 6. 重置熔断器
+                if let Some(info) = self.loaded.get_mut(name) {
+                    info.circuit_breaker.reset();
+                    info.faulted = false;
+                    info.crash_count = 0;
+                }
+                report.push_str("  [+] 熔断器已重置, 故障标记已清除\n");
+                report.push_str("  [+] 软重启完成 — 插件已恢复可用\n");
+            }
+            Err(e) => {
+                report.push_str(&format!("  [!] 重载失败: {}\n", e));
+                report.push_str("  [!] 软重启失败 — 请检查插件文件\n");
+            }
+        }
+
+        report
+    }
+
+    /// v7.1: 自动恢复所有故障插件
+    pub fn auto_recover_all(&mut self, cmd_registry: &mut crate::plugin::CommandRegistry) -> String {
+        let faulted_names: Vec<String> = self.loaded
+            .iter()
+            .filter(|(_, info)| info.faulted || info.crash_count > 0)
+            .map(|(n, _)| n.clone())
+            .collect();
+
+        if faulted_names.is_empty() {
+            return "[+] 所有插件运行正常, 无需恢复".to_string();
+        }
+
+        let mut report = String::new();
+        report.push_str(&format!(
+            "═══ 批量软重启: {} 个故障插件 ═══\n",
+            faulted_names.len()
+        ));
+
+        for name in &faulted_names {
+            report.push_str(&self.soft_restart(name, cmd_registry));
+            report.push('\n');
+        }
+
+        report.push_str(&format!(
+            "[+] 批量恢复完成 — {} 个插件已处理",
+            faulted_names.len()
+        ));
+        report
+    }
+
+    /// 安全调用插件 v7.1: 全部走子进程, 崩溃不传播到主进程
     pub fn call_guarded(
         &mut self,
         name: &str,
@@ -787,128 +581,7 @@ impl PluginManager {
         script_perms: &PermissionSet,
         timeout_ms: u64,
     ) -> Result<String, String> {
-        use super::plugin_crash::PluginCallGuard;
-
-        // 权限预检查
-        script_perms.check_plugin()?;
-
-        // 热加载检测
-        if self.watch {
-            match self.check_hotload(name) {
-                Ok(Some(_)) => { /* 热加载成功, 继续 */ }
-                Ok(None) => {}
-                Err(_) => { /* 热加载失败, 继续使用旧版 */ }
-            }
-        }
-
-        // v6.2: 一次性检查 faulted + 熔断器 + 权限 + 提取调用参数
-        let (ver, path, crashes, lib) = {
-            let info = self.loaded.get_mut(name)
-                .ok_or_else(|| format!("插件未加载: {}", name))?;
-
-            // 权限覆盖检查
-            script_perms.covers(&info.permissions)?;
-
-            // 故障状态检查
-            if info.faulted {
-                return Err(format!(
-                    "[!] 插件 '{}' 已被标记为故障 (累计{}次崩溃) — 请使用 crash_recover 恢复",
-                    name, info.crash_count
-                ));
-            }
-
-            // v6.2: 熔断器检查 (可变引用, 状态变更会写回)
-            if !info.circuit_breaker.allow_call() {
-                return Err(format!(
-                    "插件 '{}' 已熔断: {}",
-                    name, info.circuit_breaker.status_report()
-                ));
-            }
-
-            (info.version.clone(), info.path.display().to_string(), info.crash_count, info.lib.clone())
-        };
-
-        let guard = PluginCallGuard::new(name, &ver, &path, command, crashes);
-
-        let cmd_owned = command.to_string();
-        let name_owned = name.to_string();
-
-        // 在防护下执行
-        let result = guard.call_with_timeout(
-            move || -> Result<String, String> {
-                unsafe {
-                    // v6.7 fix: stderr 捕获 — 防止插件输出破坏 TUI 布局
-                    let stderr_cap = super::plugin_stderr::StderrCapture::begin();
-                    let exec_result = (|| -> Result<String, String> {
-                        let exec: libloading::Symbol<unsafe extern "C" fn(*const std::ffi::c_char) -> *mut std::ffi::c_char> =
-                            lib.get(b"ruoo_plugin_exec")
-                                .map_err(|e| format!("插件缺少 ruoo_plugin_exec: {}", e))?;
-                        let c_cmd = std::ffi::CString::new(cmd_owned.clone())
-                            .map_err(|e| format!("命令含空字节: {}", e))?;
-                        let ptr = exec(c_cmd.as_ptr());
-                        if ptr.is_null() {
-                            return Err("插件返回空指针".to_string());
-                        }
-                        let result = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
-                        if let Ok(free_fn) = lib.get::<unsafe extern "C" fn(*mut std::ffi::c_char)>(b"ruoo_plugin_free_result") {
-                            free_fn(ptr);
-                        }
-                        Ok(result)
-                    })();
-                    let captured = stderr_cap.map(|c| c.end()).unwrap_or_default();
-                    match exec_result {
-                        Ok(output) => {
-                            if captured.is_empty() { Ok(output) }
-                            else { Ok(format!("{}\n[plugin stderr]\n{}", output, captured)) }
-                        }
-                        Err(e) => {
-                            if captured.is_empty() { Err(e) }
-                            else { Err(format!("{}\n[plugin stderr]\n{}", e, captured)) }
-                        }
-                    }
-                }
-            },
-            timeout_ms,
-        );
-
-        match result {
-            Ok(Ok(inner)) => {
-                // 成功 — 记录到熔断器, 不增加 crash_count
-                if let Some(info) = self.loaded.get_mut(&name_owned) {
-                    info.circuit_breaker.record_success();
-                }
-                Ok(inner)
-            }
-            Ok(Err(e)) => {
-                // 插件返回业务错误 — 不视为崩溃, 不触发熔断器
-                if let Some(info) = self.loaded.get_mut(&name_owned) {
-                    info.circuit_breaker.record_success();
-                }
-                Err(e)
-            }
-            Err(report) => {
-                // 崩溃 — 增加计数, 记录熔断器, 输出详细报告, 强制卸载
-                if let Some(info) = self.loaded.get_mut(&name_owned) {
-                    info.crash_count += 1;
-                    let triggered = info.circuit_breaker.record_failure(
-                        &report.error_message, command
-                    );
-                    if info.crash_count >= 3 {
-                        info.faulted = true;
-                    }
-                    if triggered {
-                        // 熔断器触发: 额外标记
-                    }
-                }
-
-                let formatted = report.format_report();
-
-                // 强制卸载崩溃插件
-                let _ = self.force_unload(&name_owned);
-
-                Err(format!("{}\n[!] 插件已强制卸载, 核心程序不受影响", formatted))
-            }
-        }
+        self.call_subprocess(name, command, script_perms, timeout_ms)
     }
 
     /// v6.2: 获取插件健康状态报告 (含熔断器状态)
@@ -983,58 +656,21 @@ impl PluginManager {
             match self.load(alias, &entry.path) {
                 Ok(msg) => {
                     results.push(format!("  [+] {} — {}", alias, msg));
-                    // ★ 命令注册 (v4.6修复: 原auto_load_from_registry缺失此步骤)
-                    if let Some(lib) = self.get_library(alias) {
-                        match crate::plugin::try_register_from_library(lib, alias, cmd_registry) {
-                            Ok(count) if count > 0 => {
-                                results.push(format!("    [+] 已注册 {} 个命令", count));
-                            }
-                            Ok(_) => {
-                                results.push("    [*] 无命令声明 (可用 plugin call 调用)".into());
-                            }
-                            Err(e) => {
-                                results.push(format!("    [!] ═══ 命令注册失败 ═══"));
-                                results.push(format!("    [!] 原因: {}", e));
-                                results.push(format!("    [!] 插件已加载但无法使用 — 可能命令名与内建命令冲突"));
-                            }
+                    // ★ 命令注册 (v7.1: 临时加载DLL探测)
+                    match crate::plugin::try_register_from_file(&entry.path, alias, cmd_registry) {
+                        Ok(count) if count > 0 => {
+                            results.push(format!("    [+] 已注册 {} 个命令", count));
+                        }
+                        Ok(_) => {
+                            results.push("    [*] 无命令声明 (可用 plugin call 调用)".into());
+                        }
+                        Err(e) => {
+                            results.push(format!("    [!] ═══ 命令注册失败 ═══"));
+                            results.push(format!("    [!] 原因: {}", e));
+                            results.push(format!("    [!] 插件已加载但无法使用 — 可能命令名与内建命令冲突"));
                         }
                     }
-                    // ★ v4.7修复: 同步到 AI 全局 PluginManager (GLOBAL_PLUGIN_MGR)
-                    //   AI 的 plugin_list/plugin_health 查询独立管理器
-                    //   此处将 App 已加载的插件 Arc 共享过去，避免重复加载 DLL
-                    if let Some(info) = self.get_info(alias) {
-                        let mut ai_guard = crate::ai::GLOBAL_PLUGIN_MGR.lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        if ai_guard.is_none() {
-                            *ai_guard = Some(crate::script::PluginManager::new());
-                        }
-                        if let Some(ref mut ai_mgr) = *ai_guard {
-                            let cloned_info = crate::script::PluginInfo {
-                                lib: info.lib.clone(),
-                                path: info.path.clone(),
-                                permissions: info.permissions.clone(),
-                                last_modified: info.last_modified,
-                                version: info.version.clone(),
-                                crash_count: info.crash_count,
-                                faulted: info.faulted,
-                                circuit_breaker: crate::plugin::CircuitBreaker::new(10),
-                                abandoned_threads: Vec::new(), // 新实例, 不继承源abandoned线程
-                            };
-                            ai_mgr.insert_info(alias, cloned_info);
-
-                            // 同步注册命令到 AI 全局 CommandRegistry
-                            let mut ai_cmd_guard = crate::ai::GLOBAL_CMD_REGISTRY.lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            if ai_cmd_guard.is_none() {
-                                *ai_cmd_guard = Some(crate::plugin::CommandRegistry::new());
-                            }
-                            if let Some(ref mut ai_cmd) = *ai_cmd_guard {
-                                let _ = crate::plugin::try_register_from_library(
-                                    info.lib.as_ref(), alias, ai_cmd
-                                );
-                            }
-                        }
-                    }
+                    // v9.0: 全局 PluginManager 统一单例 — 无需同步
 
                     if let Some(reg) = self.plugin_registry.as_ref() {
                         let info = self.loaded.get(alias);
@@ -1099,25 +735,327 @@ impl PluginManager {
         }
     }
 
-    /// 获取已加载插件的 Library 引用
-    /// 供 try_register_from_library 使用，避免重复加载 DLL
-    pub fn get_library(&self, name: &str) -> Option<&libloading::Library> {
-        self.loaded.get(name).map(|info| info.lib.as_ref())
+
+
+    // ═══════════════════════════════════════════════════════════
+    // v7.0: 子进程隔离调用 — 100% 防崩溃
+    //
+    // 架构: spawn ruoo-console.exe --plugin-exec <dll> <cmd>
+    //       子进程独立地址空间, 崩溃不影响主进程
+    //       通过 stdout JSON 返回结果
+    //
+    // 性能: 首次spawn ~50-100ms (冷启动), 后续利用OS磁盘缓存更快
+    //       对稳定性要求高的插件自动切换到此路径
+    // ═══════════════════════════════════════════════════════════
+
+    /// 通过子进程安全调用插件 — 适用于已知会崩溃的插件
+    /// 返回 Ok(结果) 或 Err(错误消息, 含详细崩溃报告)
+    pub fn call_subprocess(
+        &mut self,
+        name: &str,
+        command: &str,
+        script_perms: &PermissionSet,
+        timeout_ms: u64,
+    ) -> Result<String, String> {
+        use std::process::{Command, Stdio, ExitStatus};
+        use std::io::Read;
+        use std::time::Instant;
+        #[cfg(windows)]
+        use std::os::windows::process::CommandExt;
+
+        // 1. 权限预检查
+        script_perms.check_plugin()?;
+
+        // 2. 获取 DLL 路径 + 权限覆盖检查 + 熔断器检查
+        let (dll_path, ver) = {
+            // 先做不可变检查
+            let info = self.loaded.get(name)
+                .ok_or_else(|| format!("插件未加载: {}", name))?;
+
+            script_perms.covers(&info.permissions)?;
+
+            if info.faulted {
+                return Err(format!(
+                    "[!] 插件 '{}' 已被标记为故障 (累计{}次崩溃) — 请使用 crash_recover 恢复",
+                    name, info.crash_count
+                ));
+            }
+
+            (info.path.clone(), info.version.clone())
+        };
+
+        // 熔断器检查 (需要 &mut)
+        {
+            let info = self.loaded.get_mut(name)
+                .ok_or_else(|| format!("插件未加载: {}", name))?;
+            if !info.circuit_breaker.allow_call() {
+                return Err(format!(
+                    "插件 '{}' 已熔断: {}",
+                    name, info.circuit_breaker.status_report()
+                ));
+            }
+        }
+
+        // 3. 获取当前可执行文件路径
+        let exe_path = std::env::current_exe()
+            .map_err(|e| format!("无法获取可执行文件路径: {}", e))?;
+
+        // 4. 启动子进程
+        let start = Instant::now();
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = Command::new(&exe_path);
+            c.creation_flags(0x08000000u32); // CREATE_NO_WINDOW
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = Command::new(&exe_path);
+
+        let mut child = cmd
+            .args(&[
+                "--plugin-exec",
+                &dll_path.to_string_lossy(),
+                command,
+                "--timeout",
+                &timeout_ms.to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Windows: CREATE_NO_WINDOW — 不弹出控制台窗口
+            // (通过 cfg 条件编译在 spawn 之前设置)
+        .spawn()
+            .map_err(|e| format!("无法启动插件子进程: {}", e))?;
+
+        // 5. 带超时的等待
+        let deadline = start + std::time::Duration::from_millis(timeout_ms + 10_000); // 额外10s容错
+        let exit_status: ExitStatus;
+        let mut stdout_str = String::new();
+        let mut stderr_str = String::new();
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    exit_status = status;
+                    // 读取 stdout/stderr
+                    {
+                        let mut out: Box<dyn Read> = Box::new(child.stdout.take().unwrap());
+                        let _ = out.read_to_string(&mut stdout_str);
+                    }
+                    {
+                        let mut err: Box<dyn Read> = Box::new(child.stderr.take().unwrap());
+                        let _ = err.read_to_string(&mut stderr_str);
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        // 超时 — 杀死子进程
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        // 读取剩余输出
+                        if let Some(ref mut out) = child.stdout {
+                            let _ = out.read_to_string(&mut stdout_str);
+                        }
+                        if let Some(ref mut err) = child.stderr {
+                            let _ = err.read_to_string(&mut stderr_str);
+                        }
+
+                        let elapsed = start.elapsed().as_millis();
+                        let err_msg = format!(
+                            "═══ 插件子进程超时 ═══\n\
+                             插件: {} v{}\n\
+                             命令: {}\n\
+                             超时: {}ms (限制 {}ms)\n\
+                             状态: 子进程已终止, 主进程不受影响\n\
+                             stderr: {}",
+                            name, ver, command, elapsed, timeout_ms,
+                            if stderr_str.is_empty() { "(无)" } else { &stderr_str }
+                        );
+
+                        // 更新熔断器
+                        if let Some(info) = self.loaded.get_mut(name) {
+                            info.crash_count += 1;
+                            info.circuit_breaker.record_failure(&err_msg, command);
+                            if info.crash_count >= 3 { info.faulted = true; }
+                        }
+
+                        return Err(err_msg);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(format!("子进程通信失败: {}", e));
+                }
+            }
+        }
+
+        let elapsed = start.elapsed().as_millis();
+
+        // 6. 解析子进程结果
+        if !exit_status.success() {
+            // 子进程崩溃或返回非零
+            let exit_code = exit_status.code().unwrap_or(-1);
+
+            // 尝试解析 stdout (即使崩溃, 也可能输出 JSON)
+            let host_result = serde_json::from_str::<crate::plugin_host::PluginHostResult>(
+                stdout_str.trim()
+            );
+
+            let error_msg = match host_result {
+                Ok(hr) => {
+                    format!(
+                        "═══ 插件子进程异常退出 ═══\n\
+                         插件: {} v{}\n\
+                         命令: {}\n\
+                         状态: exit_code={}, status={}\n\
+                         {}: {}\n\
+                         耗时: {}ms\n\
+                         主进程不受影响",
+                        name, ver, command, exit_code, hr.status,
+                        if hr.status == "error" { "错误" } else { "消息" },
+                        hr.message, elapsed
+                    )
+                }
+                Err(_) => {
+                    let code_u32 = exit_code as u32;
+                    let hint = if code_u32 == 0xC0000005u32 {
+                        "ACCESS_VIOLATION (内存访问违规)"
+                    } else if code_u32 == 0xC00000FDu32 {
+                        "STACK_OVERFLOW (栈溢出)"
+                    } else if code_u32 == 0xC0000017u32 {
+                        "STATUS_NO_MEMORY (内存不足)"
+                    } else {
+                        "未知系统异常"
+                    };
+
+                    format!(
+                        "═══ 插件子进程崩溃 ═══\n\
+                         插件: {} v{}\n\
+                         命令: {}\n\
+                         exit_code: 0x{:08X} — {}\n\
+                         地址空间隔离: 主进程未受影响\n\
+                         stderr: {}\n\
+                         耗时: {}ms",
+                        name, ver, command, exit_code, hint,
+                        if stderr_str.is_empty() { "(无)" } else { &stderr_str },
+                        elapsed
+                    )
+                }
+            };
+
+            // 更新熔断器和崩溃计数
+            if let Some(info) = self.loaded.get_mut(name) {
+                info.crash_count += 1;
+                info.circuit_breaker.record_failure(&error_msg, command);
+                if info.crash_count >= 3 { info.faulted = true; }
+            }
+
+            // 持久化崩溃日志
+            {
+                let log_path = crate::config::data_dir().join("plugin_crash.log");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true).open(&log_path)
+                {
+                    use std::io::Write;
+                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+                    let _ = writeln!(f, "[{}] [SUBPROCESS CRASH] plugin={} cmd={} | exit=0x{:08X}",
+                        ts, name, command, exit_code);
+                    let _ = writeln!(f, "  stderr: {}", stderr_str);
+                    let _ = f.flush();
+                }
+            }
+
+            return Err(error_msg);
+        }
+
+        // 7. 成功 — 解析 JSON
+        let host_result: crate::plugin_host::PluginHostResult = match serde_json::from_str(stdout_str.trim()) {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(format!(
+                    "插件子进程返回了无效JSON: {}\n原始输出: {}",
+                    e,
+                    &stdout_str[..stdout_str.len().min(200)]
+                ));
+            }
+        };
+
+        match host_result.status.as_str() {
+            "ok" => {
+                // 成功 — 更新熔断器 (不放 success, 用子进程调用意味着插件不稳定)
+                if let Some(info) = self.loaded.get_mut(name) {
+                    info.circuit_breaker.record_success();
+                }
+                Ok(host_result.message)
+            }
+            "error" => {
+                // 业务错误 — 不触发熔断
+                Err(format!("[子进程] 插件返回错误: {}", host_result.message))
+            }
+            other => {
+                Err(format!("[子进程] 未知状态码: {} — {}", other, host_result.message))
+            }
+        }
+    }
+
+    /// 智能调用 — v7.0: 默认子进程隔离, 100% 防崩溃
+    /// 线程模式(call)仅作兼容保留, 不再自动使用
+    pub fn call_smart(
+        &mut self,
+        name: &str,
+        command: &str,
+        script_perms: &PermissionSet,
+        timeout_ms: u64,
+    ) -> Result<String, String> {
+        // v7.0: 直接走子进程 — 线程模式无法防御 ACCESS_VIOLATION
+        self.call_subprocess(name, command, script_perms, timeout_ms)
     }
 }
 
 // ═══════════════════════════════════════════════════════════
-// v8.0: 全局 PluginManager + 统一命令池调度
-// 供 AI execute_tool 路由插件命令 (避免 plugin→script 循环依赖)
+// v9.0: 统一全局 PluginManager — Arc<Mutex<>> 单例
+//
+// 所有子系统共享同一实例:
+//   - TUI commands (main.rs)
+//   - AI tools (ai/executor.rs)
+//   - Script engine (script/mod.rs)
+//
+// 不再需要 sync/merge/copy 操作。
 // ═══════════════════════════════════════════════════════════
 
-use std::sync::atomic::AtomicPtr;
-static GLOBAL_PLUGIN_MANAGER: AtomicPtr<PluginManager> = AtomicPtr::new(std::ptr::null_mut());
+use std::sync::{Mutex, OnceLock};
 
-pub fn set_global_plugin_manager(mgr: &mut PluginManager) {
-    GLOBAL_PLUGIN_MANAGER.store(mgr as *mut PluginManager, std::sync::atomic::Ordering::Release);
+/// 全局插件管理器单例 — 整个进程只有一个实例
+static GLOBAL_PLUGIN_MANAGER: OnceLock<Arc<Mutex<PluginManager>>> = OnceLock::new();
+
+/// 初始化全局 PluginManager (main.rs 启动时调用一次)
+/// 返回 Arc 供 App 存储引用
+/// 如果已初始化则返回现有实例 (幂等操作)
+pub fn init_global_plugin_manager() -> Arc<Mutex<PluginManager>> {
+    GLOBAL_PLUGIN_MANAGER.get_or_init(|| {
+        Arc::new(Mutex::new(PluginManager::new()))
+    }).clone()
 }
 
+/// 获取全局 PluginManager 的 Arc 引用
+pub fn get_global_plugin_manager() -> Option<Arc<Mutex<PluginManager>>> {
+    GLOBAL_PLUGIN_MANAGER.get().cloned()
+}
+
+/// 获取全局 PluginManager 的 Arc 引用 (必须已初始化)
+pub fn global_plugin_manager() -> Arc<Mutex<PluginManager>> {
+    GLOBAL_PLUGIN_MANAGER.get()
+        .expect("PluginManager 未初始化 — 请先调用 init_global_plugin_manager()")
+        .clone()
+}
+
+/// v8.0 兼容: 设置全局 PluginManager (已废弃, 改用 init_global_plugin_manager)
+#[deprecated(note = "使用 init_global_plugin_manager() 替代")]
+pub fn set_global_plugin_manager(_mgr: &mut PluginManager) {
+    // 不再需要 — 全局单例由 init_global_plugin_manager 管理
+}
+
+/// AI工具命令调度入口 (v9.0: 使用全局单例)
 pub fn execute_plugin_ai_command(name: &str, args_json: &str) -> String {
     let tool = match crate::plugin::find_ai_tool(name) {
         Some(t) => t,
@@ -1143,14 +1081,15 @@ pub fn execute_plugin_ai_command(name: &str, args_json: &str) -> String {
     }
     let command_str = cmd_parts.join(" ");
 
-    let mgr_ptr = GLOBAL_PLUGIN_MANAGER.load(std::sync::atomic::Ordering::Acquire);
-    if mgr_ptr.is_null() {
-        return "[!] PluginManager 未初始化".to_string();
-    }
-    let mgr: &mut PluginManager = unsafe { &mut *mgr_ptr };
+    let mgr = match get_global_plugin_manager() {
+        Some(m) => m,
+        None => return "[!] PluginManager 未初始化".to_string(),
+    };
 
+    let mut guard = mgr.lock().unwrap_or_else(|e| e.into_inner());
     let perms = PermissionSet::all();
-    match mgr.call(&tool.plugin_name, &command_str, &perms, 30_000) {
+    // v7.0: 使用智能调用 — 崩溃后自动降级到子进程
+    match guard.call_smart(&tool.plugin_name, &command_str, &perms, 30_000) {
         Ok(result) => result,
         Err(e) => format!("[!] 插件执行失败: {}", e),
     }

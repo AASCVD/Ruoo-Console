@@ -36,9 +36,9 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
         let required = AiPermLevel::from_i32(tool_def.perm_level as i32);
         if let Err(e) = check_tool_perm(required, name) { return e; }
 
-        let mut guard = global_plugin_mgr();
-        let result = match guard.as_mut() {
-            Some(mgr) => {
+        let result = match global_plugin_mgr() {
+            Some(mgr_arc) => {
+                let mut mgr = mgr_arc.lock().unwrap_or_else(|e| e.into_inner());
                 // 构建命令字符串: "tool_name param1=val1 param2=val2 ..."
                 let mut cmd_parts = vec![name.to_string()];
                 for param in &tool_def.params {
@@ -57,7 +57,7 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
                     Err(e) => format!("[!] 插件AI工具 '{}' 执行失败: {}", name, e),
                 }
             }
-            None => format!("[!] 插件 '{}' 未加载 — AI工具 '{}' 不可用", tool_def.plugin_name, name),
+            None => format!("[!] 插件管理器未初始化 — AI工具 '{}' 不可用", name),
         };
 
         crate::telemetry::push_tool_start(name);
@@ -67,8 +67,8 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
     // ★ v5.2: 降级检查通用命令注册表 (插件命令 — 不用 is_ai_tool)
     if let Some(cmd_def) = with_global_cmd_registry(|reg| reg.find(name).cloned()).flatten() {
         if !cmd_def.plugin_name.is_empty() && !cmd_def.is_builtin {
-            let mut guard = global_plugin_mgr();
-            if let Some(mgr) = guard.as_mut() {
+            if let Some(mgr_arc) = global_plugin_mgr() {
+                let mut mgr = mgr_arc.lock().unwrap_or_else(|e| e.into_inner());
                 // 构建位置参数: "cmd arg1 arg2 ..."
                 let mut cmd_parts = vec![name.to_string()];
                 if let Some(obj) = args.as_object() {
@@ -915,10 +915,10 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
                 return format!("[!] 安全拦截: 路径包含非法字符 '..' — 路径遍历攻击被阻止");
             }
 
-            // ★ 使用全局持久 PluginManager — 插件不会在工具调用后被卸载
-            let mut guard = global_plugin_mgr();
-            if guard.is_none() { *guard = Some(crate::script::PluginManager::new()); }
-            let mgr = guard.as_mut().unwrap();
+            // ★ v9.0: 使用统一全局 PluginManager 单例
+            let mgr_arc = global_plugin_mgr()
+                .unwrap_or_else(|| panic!("PluginManager 未初始化"));
+            let mut mgr = mgr_arc.lock().unwrap_or_else(|e| e.into_inner());
 
             // 如果已加载，先卸载旧版本
             let _ = mgr.unload(&name);
@@ -970,9 +970,9 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
             if name.is_empty() || command.is_empty() {
                 return "[!] 用法: plugin_call <name> <command> — 例: plugin_call myplug \"scan 192.168.1.1\"".into();
             }
-            let mut guard = global_plugin_mgr();
-            match guard.as_mut() {
-                Some(mgr) => {
+            match global_plugin_mgr() {
+                Some(mgr_arc) => {
+                    let mut mgr = mgr_arc.lock().unwrap_or_else(|e| e.into_inner());
                     let perms = crate::script::PermissionSet::all();
                     match mgr.call(&name, &command, &perms, 30_000) {
                         Ok(result) => format!("[plugin:{}] {}", name, result),
@@ -990,28 +990,31 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
                 return "[!] 用法: plugin_unload <name>".into();
             }
             // v6.1 fix: 先卸载, 成功后注销命令 (卸载失败则保留命令, 防止僵尸状态)
-            let mut guard = global_plugin_mgr();
-            match guard.as_mut() {
-                Some(mgr) => match mgr.unload(&name) {
-                    Ok(()) => {
-                        let mut cmd_guard = global_cmd_registry();
-                        if let Some(ref mut reg) = *cmd_guard {
-                            reg.unregister_plugin(&name);
+            match global_plugin_mgr() {
+                Some(mgr_arc) => {
+                    let mut mgr = mgr_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    match mgr.unload(&name) {
+                        Ok(()) => {
+                            let mut cmd_guard = global_cmd_registry();
+                            if let Some(ref mut reg) = *cmd_guard {
+                                reg.unregister_plugin(&name);
+                            }
+                            drop(cmd_guard);
+                            crate::plugin::unregister_ai_tools(&name);
+                            format!("[+] 插件已卸载: {} — 命令+AI工具已注销", name)
                         }
-                        drop(cmd_guard);
-                        crate::plugin::unregister_ai_tools(&name);
-                        format!("[+] 插件已卸载: {} — 命令+AI工具已注销", name)
+                        Err(e) => format!("[!] 卸载失败: {} — 命令和AI工具已保留", e),
                     }
-                    Err(e) => format!("[!] 卸载失败: {} — 命令和AI工具已保留", e),
                 },
                 None => "[!] 无已加载插件".into(),
             }
         }
 
         "plugin_list" => {
-            let guard = global_plugin_mgr();
-            match guard.as_ref() {
-                Some(mgr) => {
+
+            match global_plugin_mgr() {
+                Some(mgr_arc) => {
+                    let mgr = mgr_arc.lock().unwrap_or_else(|e| e.into_inner());
                     let details = mgr.list_detailed();
                     if details.is_empty() {
                         "[plugin] 无已加载插件".into()
@@ -1043,20 +1046,23 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
                 return "[!] 用法: plugin_force_unload <name> — 强制卸载崩溃/挂起的插件".into();
             }
             // v6.1 fix: 先检查插件是否存在, 再卸载+注销命令
-            let mut guard = global_plugin_mgr();
-            let result = match guard.as_mut() {
-                Some(mgr) => match mgr.force_unload(&name) {
-                    Ok(msg) => {
-                        // 只有成功卸载后才注销命令和AI工具
-                        let mut cmd_guard = global_cmd_registry();
-                        if let Some(ref mut reg) = *cmd_guard {
-                            reg.unregister_plugin(&name);
+
+            let result = match global_plugin_mgr() {
+                Some(mgr_arc) => {
+                    let mut mgr = mgr_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    match mgr.force_unload(&name) {
+                        Ok(msg) => {
+                            // 只有成功卸载后才注销命令和AI工具
+                            let mut cmd_guard = global_cmd_registry();
+                            if let Some(ref mut reg) = *cmd_guard {
+                                reg.unregister_plugin(&name);
+                            }
+                            drop(cmd_guard);
+                            crate::plugin::unregister_ai_tools(&name);
+                            format!("[+] {}", msg)
                         }
-                        drop(cmd_guard);
-                        crate::plugin::unregister_ai_tools(&name);
-                        format!("[+] {}", msg)
+                        Err(e) => format!("[!] 强制卸载失败: {}", e),
                     }
-                    Err(e) => format!("[!] 强制卸载失败: {}", e),
                 },
                 None => format!("[!] 插件 '{}' 未加载 — 无需卸载", name),
             };
@@ -1069,11 +1075,14 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
             if name.is_empty() {
                 return "[!] 用法: plugin_reload <name> — 热重载指定插件 (卸载旧版→加载新版, 失败自动回滚)".into();
             }
-            let mut guard = global_plugin_mgr();
-            match guard.as_mut() {
-                Some(mgr) => match mgr.hotload(&name) {
-                    Ok(msg) => format!("[↻] 热重载成功: {}", msg),
-                    Err(e) => format!("[!] 热重载失败: {}", e),
+
+            match global_plugin_mgr() {
+                Some(mgr_arc) => {
+                    let mut mgr = mgr_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    match mgr.hotload(&name) {
+                        Ok(msg) => format!("[↻] 热重载成功: {}", msg),
+                        Err(e) => format!("[!] 热重载失败: {}", e),
+                    }
                 },
                 None => format!("[!] 插件 '{}' 未加载 — 无法热重载", name),
             }
@@ -1085,13 +1094,12 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
             if name.is_empty() {
                 return "[!] 用法: plugin_crash_recover <name> — 自动诊断并恢复崩溃插件".into();
             }
-            // v6.1 fix: 先执行恢复, 只有成功卸载后才注销命令
-            let mut guard = global_plugin_mgr();
-            let result = match guard.as_mut() {
-                Some(mgr) => {
+
+            let result = match global_plugin_mgr() {
+                Some(mgr_arc) => {
+                    let mut mgr = mgr_arc.lock().unwrap_or_else(|e| e.into_inner());
                     let (report, success) = mgr.crash_recover(&name);
                     if success {
-                        // 只有成功恢复(含卸载)后才注销命令
                         let mut cmd_guard = global_cmd_registry();
                         if let Some(ref mut reg) = *cmd_guard {
                             reg.unregister_plugin(&name);
@@ -1106,11 +1114,49 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
             result
         }
 
+        // ── v7.1: 插件软重启 ──
+        "plugin_restart" => {
+            if let Err(e) = check_tool_perm(AiPermLevel::Dangerous, "plugin_restart") { return e; }
+            let name = s("name");
+            if name.is_empty() {
+                return "[!] 用法: plugin_restart <name> — 软重启崩溃插件 (卸载→重载→注册命令→重置熔断器)".into();
+            }
+            match global_plugin_mgr() {
+                Some(mgr_arc) => {
+                    let mut mgr = mgr_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut cmd_guard = global_cmd_registry();
+                    if cmd_guard.is_none() { *cmd_guard = Some(crate::plugin::CommandRegistry::new()); }
+                    let cmd_reg = cmd_guard.as_mut().unwrap();
+                    let report = mgr.soft_restart(&name, cmd_reg);
+                    drop(cmd_guard);
+                    report
+                }
+                None => format!("[!] PluginManager 未初始化 — 插件 '{}' 无法软重启", name),
+            }
+        }
+
+        "plugin_recover_all" => {
+            if let Err(e) = check_tool_perm(AiPermLevel::Dangerous, "plugin_recover_all") { return e; }
+            match global_plugin_mgr() {
+                Some(mgr_arc) => {
+                    let mut mgr = mgr_arc.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut cmd_guard = global_cmd_registry();
+                    if cmd_guard.is_none() { *cmd_guard = Some(crate::plugin::CommandRegistry::new()); }
+                    let cmd_reg = cmd_guard.as_mut().unwrap();
+                    let report = mgr.auto_recover_all(cmd_reg);
+                    drop(cmd_guard);
+                    report
+                }
+                None => "[!] PluginManager 未初始化".into(),
+            }
+        }
+
         "plugin_health" => {
             let name = s("name");
-            let guard = global_plugin_mgr();
-            match guard.as_ref() {
-                Some(mgr) => {
+
+            match global_plugin_mgr() {
+                Some(mgr_arc) => {
+                    let mgr = mgr_arc.lock().unwrap_or_else(|e| e.into_inner());
                     if name.is_empty() {
                         mgr.plugin_health_summary()
                     } else {
