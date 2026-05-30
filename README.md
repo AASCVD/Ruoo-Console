@@ -1,4 +1,4 @@
-# RUOO-CONSOLE v4.1
+# RUOO-CONSOLE v4.1.4
 
 终端原生面板。TUI 控制台，内置 AI 助手、插件系统、加密保险库，200+ 工具集 — 全部运行在你的终端里。
 
@@ -21,7 +21,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ### 构建与运行
 
 ```
-git clone <仓库地址> ruoo-console
+git clone https://github.com/AASCVD/Ruoo-Console ruoo-console
 cd ruoo-console
 cargo build --release
 target/release/ruoo-console.exe
@@ -61,7 +61,7 @@ plugin call scanner port_scan --target 192.168.1.1 --ports 1-1000
 plugin reg scanner scanner.dll true 0    # 持久化 + 自动加载
 ```
 
-完整插件 SDK：进度条、Vault 访问、消息代理、插件间通信总线、熔断器、崩溃恢复。详见 [PLUGIN_DEV_GUIDE.md](PLUGIN_DEV_GUIDE.md)（75KB 深度指南）。
+插件在独立子进程中执行 (v7.0)，崩溃不传播到主进程。完整插件 SDK：进度条、Vault 访问、消息代理、插件间通信总线、熔断器、崩溃恢复。详见 [PLUGIN_DEV_GUIDE.md](PLUGIN_DEV_GUIDE.md)（84KB 深度指南, v10.0）。
 
 ### 加密保险库 Vault
 
@@ -130,7 +130,7 @@ compile c exploit.c -o exploit.exe
 
 | 分类 | 数量 | 示例 |
 |---|---|---|
-| 核心命令 | 29 | help, exec, config, status, clear, dpai |
+| 核心命令 | 33 | help, exec, config, status, clear, dpai, exec_bg, httpget... |
 | 文件操作 | 41 | read_file, write_file, grep, hexdump, shred, stream_grep |
 | 插件扩展 | 15 | plugin load/call/unload/reg/health |
 | 脚本引擎 | 8 | run, script new/edit/permit |
@@ -138,8 +138,7 @@ compile c exploit.c -o exploit.exe
 | Vault保险库 | 10 | vault set/get/list/remember/recall |
 | AI数据 | 3 | aisave, airead, ailist |
 | 启动脚本 | 5 | bootscript edit/run/reset/clear |
-| 网络工具 | 8 | httpget, httppost, port_scan, dns_lookup, whois |
-| 编译器 | 7 | compile, clist, build (rust/c/cpp/go/java/cs/python/asm/zig) |
+| 编译器 | 11 | compile, compilers, compile-rust/c/cpp/go/java/cs/py/asm/zig |
 
 使用 `help` 或 F9 进入交互式帮助浏览器，共 9 页分屏显示。
 
@@ -170,11 +169,15 @@ ruoo-console/
 │   ├── vault.rs             # AES-256-GCM 加密数据库
 │   ├── plugin.rs            # 插件系统核心，命令注册表，AI 工具注册
 │   ├── plugin_registry.rs   # 加密插件注册表 (持久化存储)
-│   ├── plugin_vault.rs      # 插件可访问的 Vault (AES-256-GCM + 安全擦除)
+│   ├── plugin_host.rs       # 子进程执行宿主 (v7.0 进程隔离)
+│   ├── host_abi.rs          # HostAPI 函数指针表 + 主/子双模式
+│   ├── plugin_vault.rs      # 插件保险库 (AES-256-GCM + Zstd + 7-pass 擦除)
 │   ├── plugin_progress.rs   # 多进度条管理器 (C ABI)
 │   ├── message_broker.rs    # 结构化消息，速率限制，插件间通信
 │   ├── memsec.rs            # 内存安全 SecStr (XOR 加密 + mlock + volatile 零化)
 │   ├── panic_guard.rs       # 全局崩溃防护，脱敏崩溃日志
+│   ├── secure_channel.rs    # 加密安全通道
+│   ├── stealth.rs           # 隐身/反检测
 │   ├── tabs.rs              # 标签页管理
 │   ├── clipboard.rs         # 剪贴板集成 (复制/粘贴/剪切)
 │   ├── shortcuts.rs         # 键盘快捷键处理
@@ -199,6 +202,8 @@ ruoo-console/
 │   │   ├── gen.rs           # 生成器 (UUID/密码/哈希)
 │   │   ├── kernel.rs        # 内核驱动操作
 │   │   ├── fault_tolerant.rs # 容错与错误恢复
+│   │   ├── payloads.rs      # 载荷生成
+│   │   ├── recon.rs         # 侦察工具
 │   │   └── orchestrator.rs  # 工具编排
 │   ├── ai/
 │   │   ├── mod.rs           # AI 模块入口
@@ -230,7 +235,7 @@ ruoo-console/
 ├── temporary files/         # 临时文件工作区
 ├── junk files/              # 废弃文件
 ├── downloads/               # 下载目录
-├── PLUGIN_DEV_GUIDE.md      # 完整插件开发指南 (75KB)
+├── PLUGIN_DEV_GUIDE.md      # 完整插件开发指南 (84KB)
 ├── system_prompt.txt         # AI 系统提示词模板
 ├── build.rs                 # 构建脚本 (版本信息，Windows 资源)
 ├── Cargo.toml               # 项目清单
@@ -247,12 +252,12 @@ ruoo-console/
 | theme_name | cyber | TUI 配色主题 |
 | font_size | 14 | 终端字体大小参考 |
 | timeout_ms | 30000 | 默认工具超时 |
-| connect_timeout_ms | 3000 | TCP 连接超时 |
+| connect_timeout_ms | 10000 | TCP 连接超时 |
 | exec_timeout_ms | 120000 | 系统命令超时 |
 | port_range | 1-10000 | 默认端口扫描范围 |
 | max_history | 500 | 命令历史容量 |
 | max_output_lines | 10000 | 输出缓冲区上限 |
-| deepseek_api_url | api.deepseek.com/v1 | AI API 地址 |
+| deepseek_api_url | https://api.deepseek.com/v1/chat/completions | AI API 地址 |
 | deepseek_model | deepseek-v4-pro | AI 模型 |
 | ai_enabled | false | AI 开关 |
 
@@ -264,7 +269,7 @@ ruoo-console/
 
 Vault 保险库：AES-256-GCM 认证加密。PBKDF2-HMAC-SHA256 密钥派生，60 万次迭代。可配置超时自动锁定。删除条目 7 遍覆写（随机 + 归零）。
 
-插件沙箱：每插件可配置独立沙箱 — 网络白名单/黑名单、文件系统路径限制、内存上限、子进程数量限制、执行超时。
+插件沙箱：粗粒度安全开关 — 网络/文件系统/子进程执行/插件间调用 各自独立启禁，配以超时和内存上限。插件通过子进程隔离执行，崩溃不传播到主进程。
 
 崩溃防护：全局 panic hook 捕获所有崩溃，脱敏处理堆栈回溯，写入 `%TEMP%/ruoo_crash.log`。单个工具 panic 被隔离捕获，不会拖垮整个控制台。
 
