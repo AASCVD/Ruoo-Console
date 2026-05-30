@@ -5,7 +5,8 @@
 // v9.0: GLOBAL_PLUGIN_MGR 已迁移到 script::plugin_mgr 统一单例
 //       所有插件操作通过 script::get_global_plugin_manager() / global_plugin_manager()
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use crate::ai::types::AiPermLevel;
 
 // ── 全局命令注册表 — 供 AI plugin_load/help 使用 ──
@@ -95,6 +96,67 @@ pub(crate) fn get_ai_perm_level() -> AiPermLevel {
 
 // ── 清理请求标志 — execute_tool 设置 → send() 处理 ──
 pub(crate) static CLEAR_HISTORY_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// ═══════════════════════════════════════════════════
+// 后台进程管理器 — exec_bg/exec_send/exec_kill/exec_list 共享
+// ═══════════════════════════════════════════════════
+
+pub(crate) struct BgProcState {
+    pub child: std::process::Child,
+    pub command: String,
+    pub started: String,
+}
+
+static BG_PROC_MAP: OnceLock<Mutex<HashMap<u32, BgProcState>>> = OnceLock::new();
+
+pub(crate) fn bg_proc_map() -> &'static Mutex<HashMap<u32, BgProcState>> {
+    BG_PROC_MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// stdin 管道单独存储 (因为 Child 被 move 后无法再访问 stdin)
+static BG_STDIN_MAP: OnceLock<Mutex<HashMap<u32, std::process::ChildStdin>>> = OnceLock::new();
+
+pub(crate) fn bg_stdin_map() -> &'static Mutex<HashMap<u32, std::process::ChildStdin>> {
+    BG_STDIN_MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 清理指定 PID 的全部资源 (BgProcState + stdin pipe)
+pub(crate) fn bg_cleanup(pid: u32) {
+    if let Some(map) = BG_PROC_MAP.get() {
+        if let Ok(mut guard) = map.lock() {
+            if let Some(mut state) = guard.remove(&pid) {
+                let _ = state.child.kill();
+                let _ = state.child.try_wait(); // 非阻塞, 避免卡死
+            }
+        }
+    }
+    if let Some(map) = BG_STDIN_MAP.get() {
+        if let Ok(mut guard) = map.lock() {
+            guard.remove(&pid);
+        }
+    }
+}
+
+/// 清理所有已退出进程
+pub(crate) fn bg_cleanup_dead() {
+    let dead_pids: Vec<u32> = {
+        if let Some(map) = BG_PROC_MAP.get() {
+            if let Ok(mut guard) = map.lock() {
+                let mut pids = Vec::new();
+                for (pid, state) in guard.iter_mut() {
+                    if let Ok(Some(_)) = state.child.try_wait() {
+                        pids.push(*pid);
+                    }
+                }
+                pids
+            } else { return; }
+        } else { return; }
+    };
+
+    for pid in dead_pids {
+        bg_cleanup(pid);
+    }
+}
 
 // ── 工具强制中断标志 — abort_tool 设置 → 工具执行循环检测 → 丢弃未执行工具 ──
 pub(crate) static TOOL_ABORT_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

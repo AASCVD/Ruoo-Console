@@ -414,7 +414,39 @@ pub fn process_cmd(app: &mut App, raw: &str) {
         "save"    => cmd_save(app, &arg1),
         "dpai"    => cmd_dpai(app),
         "vault"   => cmd_vault(app, &arg1, &arg2),
-        "rustc" | "compile" | "compile-rust" => cmd_rustc(app, &arg1, &arg2, rest),
+        "rustc" | "compile-rust" => cmd_rustc(app, &arg1, &arg2, rest),
+        "compile" => {
+            // 通用编译器 — 根据第一个参数(语言)分发
+            match arg1.as_deref() {
+                Some("rust") | Some("rs") => cmd_rustc(app, &arg2, &None, rest),
+                Some("c") => cmd_cc(app, &arg2, &None, rest),
+                Some("cpp") | Some("c++") | Some("cxx") => cmd_compile_cpp(app, &arg2, &None, rest),
+                Some("go") => cmd_compile_go(app, &arg2, &None, rest),
+                Some("java") => cmd_compile_java(app, &arg2, &None, rest),
+                Some("cs") | Some("c#") | Some("csharp") => cmd_compile_cs(app, &arg2, &None, rest),
+                Some("python") | Some("py") => cmd_compile_python(app, &arg2, &None, rest),
+                Some("asm") | Some("nasm") => cmd_compile_asm(app, &arg2, &None, rest),
+                Some("zig") => cmd_compile_zig(app, &arg2, &None, rest),
+                Some(other) => {
+                    app.push_output(&format!("[!] 未知语言: {} — 支持: rust/c/cpp/go/java/cs/python/asm/zig", other));
+                    app.push_output("[*] 查看: compilers — 列出所有可用编译器");
+                }
+                None => {
+                    app.push_output("[*] compile — 通用编译器分发:");
+                    app.push_output("  compile rust <源> [--release]     → Rust");
+                    app.push_output("  compile c <源> [-O2]              → C");
+                    app.push_output("  compile cpp <源> [-O2]            → C++");
+                    app.push_output("  compile go <源> [-O]              → Go");
+                    app.push_output("  compile java <源>                 → Java");
+                    app.push_output("  compile cs <源> [-O]              → C#");
+                    app.push_output("  compile python <源>               → Python");
+                    app.push_output("  compile asm <源>                  → NASM");
+                    app.push_output("  compile zig <源> [-O]             → Zig");
+                    app.push_output("[*] 也可直接用: compile-rust / compile-c / … / compile-zig");
+                    app.push_output("[*] 查看: compilers — 列出所有可用编译器");
+                }
+            }
+        }
         "cc" | "gcc" | "clang" | "compile-c" => cmd_cc(app, &arg1, &arg2, rest),
         "compile-cpp" | "cxx" | "cppc" => cmd_compile_cpp(app, &arg1, &arg2, rest),
         "compile-go" | "goc" => cmd_compile_go(app, &arg1, &arg2, rest),
@@ -503,6 +535,186 @@ pub fn process_cmd(app: &mut App, raw: &str) {
         "aisave" => { app.push_output("[*] aisave — 通过AI代理: &aisave <文件名> <内容>"); }
         "airead" => { app.push_output("[*] airead — 通过AI代理: &airead <文件名>"); }
         "ailist" => { app.push_output("[*] ailist — 通过AI代理: &ailist"); }
+        // ═══ v10.0 文件操作补全 (35条 — 此前仅在mod_meta注册, 未在match实现) ═══
+        "base64" => {
+            if let (Some(ref f), Some(ref op)) = (arg1.clone(), arg2.clone()) {
+                let file = f.clone(); let op_str = op.clone();
+                spawn_async_cmd(app, format!("Base64 {}", file), move |out| {
+                    match tools::base64_file(&file, &op_str) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) }
+                });
+            } else { app.push_output("[!] 用法: base64 <文件> encode|decode"); }
+        }
+        "encdetect" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); spawn_async_cmd(app, format!("编码检测 {}", file), move |out| { match tools::file_encoding_detect(&file) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: encdetect <文件>"); }
+        }
+        "jq" => {
+            if let (Some(ref f), Some(ref q)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let query = q.clone(); spawn_async_cmd(app, format!("JSON查询 {}", file), move |out| { match tools::json_query(&file, &query) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: jq <JSON文件> <查询>"); }
+        }
+        "jkeys" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); spawn_async_cmd(app, format!("JSON键列表 {}", file), move |out| { match tools::json_keys(&file) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: jkeys <JSON文件>"); }
+        }
+        "csv" => {
+            if let Some(ref f) = arg1 {
+                let file = f.clone();
+                let max_rows = arg2.as_deref().and_then(|s| s.parse::<usize>().ok()).unwrap_or(20);
+                let delim = rest.map(|r| r.split_whitespace().last().unwrap_or(",")).unwrap_or(",").to_string();
+                spawn_async_cmd(app, format!("CSV解析 {}", file), move |out| { match tools::csv_parse(&file, max_rows, &delim) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } });
+            } else { app.push_output("[!] 用法: csv <文件> [行数] [分隔符]"); }
+        }
+        "rename" => {
+            if let (Some(ref dir), Some(ref find)) = (arg1.clone(), arg2.clone()) {
+                let d = dir.clone(); let f_pat = find.clone();
+                let repl = rest.map(|r| r.split_whitespace().last().unwrap_or("")).unwrap_or("").to_string();
+                let dry = !rest.map(|r| r.contains("--real")).unwrap_or(false);
+                spawn_async_cmd(app, format!("批量重命名 {}", d), move |out| { match tools::batch_rename(&d, &f_pat, &repl, dry) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } });
+            } else { app.push_output("[!] 用法: rename <目录> <正则> <替换> [--real]"); }
+        }
+        "tempfile" => {
+            let prefix = arg1.as_deref().unwrap_or("ruoo_").to_string();
+            let suffix = arg2.as_deref().unwrap_or(".tmp").to_string();
+            let content = rest.map(|r| r.trim().to_string()).filter(|s| !s.is_empty());
+            spawn_async_cmd(app, "创建临时文件".into(), move |out| { match tools::temp_file(&prefix, &suffix, content.as_deref()) { Ok(path) => out.push(path), Err(e) => out.push(format!("[!] {}", e)) } });
+        }
+        "syminfo" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); spawn_async_cmd(app, format!("符号链接信息 {}", file), move |out| { match tools::symlink_info(&file) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: syminfo <路径>"); }
+        }
+        "slice" => {
+            if let (Some(ref f), Some(ref start)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let s_off: usize = start.parse().unwrap_or(0); let e_off = rest.and_then(|r| r.split_whitespace().next()?.parse().ok()).unwrap_or(s_off + 1024); let out = String::new(); spawn_async_cmd(app, format!("文件切片 {}", file), move |out2| { match tools::file_slice(&file, s_off, e_off, &out) { Ok(s) => out2.push(s), Err(e) => out2.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: slice <文件> <起始> <结束> [输出]"); }
+        }
+        "sample" => {
+            if let (Some(ref f), Some(ref n)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let cnt: usize = n.parse().unwrap_or(10); let seed = rest.and_then(|r| r.split_whitespace().next()?.parse().ok()).unwrap_or(0u64); spawn_async_cmd(app, format!("行采样 {}", file), move |out| { match tools::lines_sample(&file, cnt, seed) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: sample <文件> <N> [种子]"); }
+        }
+        "empty" => {
+            if let Some(ref d) = arg1 { let dir = d.clone(); let rec = !rest.map(|r| r.contains("--flat")).unwrap_or(false); spawn_async_cmd(app, format!("空文件查找 {}", dir), move |out| { match tools::empty_files(&dir, rec) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: empty <目录> [--flat]"); }
+        }
+        "concat" => {
+            if let Some(ref files) = arg1 { let f = files.clone(); let out = arg2.as_deref().unwrap_or("concat_output.txt").to_string(); let sep = rest.map(|r| r.contains("--sep")).unwrap_or(false); spawn_async_cmd(app, format!("拼接文件"), move |out2| { match tools::file_concat(&f, &out, sep) { Ok(s) => out2.push(s), Err(e) => out2.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: concat <文件1,文件2,...> [输出] [--sep]"); }
+        }
+        "dusort" => {
+            if let Some(ref d) = arg1 { let dir = d.clone(); let depth = arg2.as_deref().and_then(|s| s.parse().ok()).unwrap_or(1usize); let top_n = 20usize; spawn_async_cmd(app, format!("目录排序 {}", dir), move |out| { match tools::du_sorted(&dir, depth, top_n) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: dusort <目录> [深度] [前N]"); }
+        }
+        "copytext" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); let max_kb = arg2.as_deref().and_then(|s| s.parse().ok()).unwrap_or(1024usize); spawn_async_cmd(app, format!("复制内容 {}", file), move |out| { match tools::file_copy_content(&file, max_kb) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: copytext <文件> [最大KB]"); }
+        }
+        "pastetext" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); let append = arg2.as_deref().map(|s| s == "--append").unwrap_or(false); spawn_async_cmd(app, format!("粘贴到 {}", file), move |out| { match tools::file_paste_content(&file, append) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: pastetext <文件> [--append]"); }
+        }
+        "copypath" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); spawn_async_cmd(app, format!("复制路径 {}", file), move |out| { match tools::file_copy_path(&file) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: copypath <文件>"); }
+        }
+        "filecut" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); spawn_async_cmd(app, format!("剪切 {}", file), move |out| { match tools::file_cut(&file) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: filecut <文件>"); }
+        }
+        "filepaste" => {
+            if let Some(ref d) = arg1 { let dir = d.clone(); spawn_async_cmd(app, format!("粘贴剪切"), move |out| { match tools::file_paste_cut(&dir) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: filepaste <目标目录>"); }
+        }
+        "cutstatus" => { app.push_output(&tools::file_cut_status()); }
+        "copymulti" => {
+            if let Some(ref paths) = arg1 { let p = paths.clone(); spawn_async_cmd(app, "批量复制路径".into(), move |out| { match tools::file_copy_multi(&p) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: copymulti <文件1,文件2,...>"); }
+        }
+        "hexdump" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); let max_bytes = arg2.as_deref().and_then(|s| s.parse().ok()).unwrap_or(1024usize); let offset = rest.and_then(|r| r.split_whitespace().next()?.parse().ok()).unwrap_or(0usize); spawn_async_cmd(app, format!("HEX转储 {}", file), move |out| { match tools::hex_dump(&file, max_bytes, offset) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: hexdump <文件> [字节数] [偏移]"); }
+        }
+        "shred" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); let passes = arg2.as_deref().and_then(|s| s.parse().ok()).unwrap_or(3usize); let pat = rest.map(|r| r.trim()).unwrap_or("zero").to_string(); spawn_async_cmd(app, format!("安全删除 {}", file), move |out| { match tools::secure_delete(&file, passes, &pat) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: shred <文件> [遍数] [zero|random|dod]"); }
+        }
+        "touch" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); spawn_async_cmd(app, format!("touch {}", file), move |out| { match tools::touch(&file) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: touch <文件>"); }
+        }
+        "filetime" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); let created = arg2.as_deref().map(|s| s.to_string()); let modified = rest.map(|r| r.split_whitespace().next().unwrap_or("").to_string()).filter(|s| !s.is_empty()); let accessed = rest.and_then(|r| r.split_whitespace().nth(1).map(|s| s.to_string())); spawn_async_cmd(app, format!("时间戳 {}", file), move |out| { match tools::set_file_times(&file, created.as_deref(), modified.as_deref(), accessed.as_deref()) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: filetime <文件> [创建时间] [修改时间] [访问时间]"); }
+        }
+        "adsread" => {
+            if let (Some(ref f), Some(ref s)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let stream = s.clone(); spawn_async_cmd(app, format!("ADS读取 {}", file), move |out| { match tools::ads_read(&file, &stream) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: adsread <文件> <流名>"); }
+        }
+        "adswrite" => {
+            if let (Some(ref f), Some(ref s)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let stream = s.clone(); let data = rest.unwrap_or("").to_string(); spawn_async_cmd(app, format!("ADS写入 {}", file), move |out| { match tools::ads_write(&file, &stream, &data) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: adswrite <文件> <流名> <数据>"); }
+        }
+        "adslist" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); spawn_async_cmd(app, format!("ADS列表 {}", file), move |out| { match tools::ads_list(&file) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: adslist <文件>"); }
+        }
+        "dirdiff" => {
+            if let (Some(ref a), Some(ref b)) = (arg1.clone(), arg2.clone()) { let d1 = a.clone(); let d2 = b.clone(); spawn_async_cmd(app, format!("目录差异 {} vs {}", d1, d2), move |out| { match tools::dir_diff(&d1, &d2) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: dirdiff <目录1> <目录2>"); }
+        }
+        "hexfind" => {
+            if let (Some(ref f), Some(ref pat)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let pattern = pat.clone(); let max_res = rest.and_then(|r| r.split_whitespace().next()?.parse().ok()).unwrap_or(50usize); spawn_async_cmd(app, format!("二进制搜索 {}", file), move |out| { match tools::binary_search(&file, &pattern, max_res) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: hexfind <文件> <HEX模式> [最大结果]"); }
+        }
+        "health" => { let lines = tools::health_check(); for l in lines { app.push_output(&l); } }
+        "regexsearch" => {
+            if let (Some(ref f), Some(ref pat)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let pattern = pat.clone(); let ci = rest.map(|r| r.contains("-i")).unwrap_or(false); let max_m = rest.map(|r| r.split_whitespace().filter_map(|s| s.parse().ok()).next()).unwrap_or(Some(100usize)).unwrap_or(100); let ctx = rest.map(|r| r.split_whitespace().filter_map(|s| s.parse().ok()).nth(1)).unwrap_or(Some(0usize)).unwrap_or(0); spawn_async_cmd(app, format!("正则搜索 {}", file), move |out| { match tools::regex_search(&file, &pattern, ci, max_m, ctx) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: regexsearch <文件> <正则> [-i] [最大匹配] [上下文]"); }
+        }
+        "byterep" => {
+            if let (Some(ref f), Some(ref off)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let offset: u64 = off.parse().unwrap_or(0); let hex = rest.unwrap_or("").to_string(); spawn_async_cmd(app, format!("字节替换 {}", file), move |out| { match tools::byte_range_replace(&file, offset, &hex) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: byterep <文件> <偏移> <HEX字节>"); }
+        }
+        "multirep" | "smi" => {
+            if let (Some(ref f), Some(ref pairs)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let p = pairs.clone(); let ci = rest.map(|r| r.contains("-i")).unwrap_or(false); let max_r = rest.map(|r| r.split_whitespace().filter_map(|s| s.parse().ok()).next()).unwrap_or(Some(10000usize)).unwrap_or(10000); spawn_async_cmd(app, format!("多模式替换 {}", file), move |out| { match tools::stream_multi_replace(&file, &p, ci, max_r) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: multirep <文件> <JSON对> [-i] [最大替换]"); }
+        }
+        "searchexport" => {
+            if let (Some(ref f), Some(ref pat)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let pattern = pat.clone(); let out = rest.map(|r| r.split_whitespace().next().unwrap_or("search_export.txt")).unwrap_or("search_export.txt").to_string(); let ci = rest.map(|r| r.contains("-i")).unwrap_or(false); let ctx = 0usize; spawn_async_cmd(app, format!("搜索导出 {}", file), move |out2| { match tools::search_export(&file, &pattern, &out, ci, ctx) { Ok(s) => out2.push(s), Err(e) => out2.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: searchexport <文件> <模式> <输出> [-i]"); }
+        }
+        "colex" => {
+            if let (Some(ref f), Some(ref cols)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let columns = cols.clone(); let delim = rest.map(|r| r.split_whitespace().next().unwrap_or("comma")).unwrap_or("comma").to_string(); let max_r = 500usize; spawn_async_cmd(app, format!("列提取 {}", file), move |out| { match tools::column_extract(&file, &columns, &delim, max_r) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: colex <文件> <列索引> [分隔符] [最大行]"); }
+        }
+        "bindiff" | "binarydiff" => {
+            if let (Some(ref a), Some(ref b)) = (arg1.clone(), arg2.clone()) { let f1 = a.clone(); let f2 = b.clone(); let max_d = rest.and_then(|r| r.split_whitespace().next()?.parse().ok()).unwrap_or(50usize); spawn_async_cmd(app, format!("二进制差异"), move |out| { match tools::binary_diff(&f1, &f2, max_d) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: bindiff <文件1> <文件2> [最大差异]"); }
+        }
+        "chunkscan" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); let chunk_mb = arg2.as_deref().and_then(|s| s.parse().ok()).unwrap_or(64usize); let max_c = rest.and_then(|r| r.split_whitespace().next()?.parse().ok()).unwrap_or(50usize); spawn_async_cmd(app, format!("分块扫描 {}", file), move |out| { match tools::file_chunk_scan(&file, chunk_mb, max_c) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: chunkscan <文件> [块大小MB] [最大块数]"); }
+        }
+        // ═══ v10.0 大文件流式操作 (此前仅在AI工具可用, 现TUI可直接调用) ═══
+        "streamgrep" => {
+            if let (Some(ref f), Some(ref pat)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let pattern = pat.clone(); let ci = rest.map(|r| r.contains("-i")).unwrap_or(false); let max_m = 100usize; let ctx = 0usize; spawn_async_cmd(app, format!("流式搜索 {}", file), move |out| { match tools::stream_grep(&file, &pattern, ci, max_m, ctx) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: streamgrep <文件> <模式> [-i]"); }
+        }
+        "streambin" => {
+            if let (Some(ref f), Some(ref pat)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let pattern = pat.clone(); let max_r = 50usize; spawn_async_cmd(app, format!("流式二进制扫描 {}", file), move |out| { match tools::stream_binary_scan(&file, &pattern, max_r) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: streambin <文件> <HEX模式>"); }
+        }
+        "ranged" => {
+            if let (Some(ref f), Some(ref off)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let offset: u64 = off.parse().unwrap_or(0); let length = rest.and_then(|r| r.split_whitespace().next()?.parse().ok()).unwrap_or(4096usize); spawn_async_cmd(app, format!("范围读取 {}", file), move |out| { match tools::range_read(&file, offset, length) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: ranged <文件> <偏移> [长度]"); }
+        }
+        "sfr" => {
+            if let (Some(ref f), Some(ref find), Some(ref rep)) = (arg1.clone(), arg2.clone(), rest.map(|r| r.split_whitespace().next().unwrap_or(""))) { let file = f.clone(); let f_str = find.clone(); let r_str = rep.to_string(); if f_str.is_empty() || r_str.is_empty() { app.push_output("[!] 用法: sfr <文件> <查找> <替换> [-i]"); } else { let ci = rest.map(|r| r.contains("-i")).unwrap_or(false); spawn_async_cmd(app, format!("流式替换 {}", file), move |out| { match tools::stream_find_replace(&file, &f_str, &r_str, ci, 10000) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } } else { app.push_output("[!] 用法: sfr <文件> <查找> <替换> [-i]"); }
+        }
+        "bldidx" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); spawn_async_cmd(app, format!("构建索引 {}", file), move |out| { match tools::build_line_index(&file) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: bldidx <文件>"); }
+        }
+        "seekline" => {
+            if let (Some(ref f), Some(ref start)) = (arg1.clone(), arg2.clone()) { let file = f.clone(); let ls: u64 = start.parse().unwrap_or(1); let le = rest.and_then(|r| r.split_whitespace().next()?.parse().ok()); spawn_async_cmd(app, format!("索引定位 {}", file), move |out| { match tools::seek_line(&file, ls, le) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: seekline <文件> <起始行> [结束行]"); }
+        }
+        "qidx" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); spawn_async_cmd(app, format!("索引查询 {}", file), move |out| { match tools::query_line_index(&file) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: qidx <文件>"); }
+        }
+        "sfinfo" => {
+            if let Some(ref f) = arg1 { let file = f.clone(); spawn_async_cmd(app, format!("文件统计 {}", file), move |out| { match tools::stream_file_info(&file) { Ok(s) => out.push(s), Err(e) => out.push(format!("[!] {}", e)) } }); } else { app.push_output("[!] 用法: sfinfo <文件>"); }
+        }
+        // ═══ v10.1 后台进程管理 (exec_bg/exec_list/exec_kill/exec_send) ═══
+        "exec_bg" => {
+            if let Some(cmd) = rest {
+                if let Err(e) = crate::ai::validate_shell_command(cmd) {
+                    app.push_output(&format!("[!] 命令被安全策略拦截: {}", e));
+                    return;
+                }
+                let c = cmd.to_string();
+                let shell = arg1.as_deref().unwrap_or("cmd").to_lowercase();
+                cmd_exec_bg(app, &c, &shell);
+            } else { app.push_output("[!] 用法: exec_bg <命令> [shell]\n[*] 例: exec_bg \"python -m http.server 8080\"\n[*] 查看: exec_list | 终止: exec_kill <PID> | stdin: exec_send <PID> <文本>"); }
+        }
+        "exec_list" => { cmd_exec_list(app); }
+        "exec_kill" => {
+            if let Some(pid_str) = arg1.as_deref() {
+                match pid_str.parse::<u32>() {
+                    Ok(pid) => cmd_exec_kill(app, pid),
+                    Err(_) => app.push_output(&format!("[!] 无效PID: {}", pid_str)),
+                }
+            } else { app.push_output("[!] 用法: exec_kill <PID>"); }
+        }
+        "exec_send" => {
+            if let (Some(pid_str), Some(input)) = (arg1.as_ref(), rest) {
+                match pid_str.parse::<u32>() {
+                    Ok(pid) => cmd_exec_send(app, pid, input),
+                    Err(_) => app.push_output(&format!("[!] 无效PID: {}", pid_str)),
+                }
+            } else { app.push_output("[!] 用法: exec_send <PID> <输入文本>"); }
+        }
         _ => {
             // v7.1: 未匹配命令 → 自动转发到 AI (若已激活)
             if app.ai_mode && app.ai_session.is_some() && !app.ai_pending {
@@ -730,6 +942,194 @@ fn cmd_exec(app: &mut App, rest: Option<&str>) {
             { let mut p = prog.lock().unwrap(); p.current = 2; p.message = "Done".into(); }
         });
     } else { app.push_output("[!] 用法: exec <命令>"); }
+}
+
+// ═══ v10.1 后台进程管理 ═══
+
+fn cmd_exec_bg(app: &mut App, command: &str, shell: &str) {
+    let ts_display = chrono::Local::now().format("%H:%M:%S").to_string();
+
+    #[cfg(windows)]
+    let (shell_cmd, shell_arg) = if shell == "powershell" || shell == "ps" {
+        ("powershell", "-Command")
+    } else {
+        ("cmd", "/C")
+    };
+    #[cfg(not(windows))]
+    let (shell_cmd, shell_arg) = match shell {
+        "bash" => ("bash", "-c"),
+        _ => ("sh", "-c"),
+    };
+
+    let mut cmd = std::process::Command::new(shell_cmd);
+    cmd.args([shell_arg, command]);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            let pid = child.id();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let code = status.code().unwrap_or(-1);
+                    let mut out = String::new();
+                    let mut err = String::new();
+                    use std::io::Read;
+                    if let Some(mut s) = child.stdout.take() { let _ = s.read_to_string(&mut out); }
+                    if let Some(mut s) = child.stderr.take() { let _ = s.read_to_string(&mut err); }
+                    app.push_output(&format!("[!] 进程立即退出 (退出码:{}) PID:{}", code, pid));
+                    if !out.is_empty() { for l in out.lines() { app.push_output(&format!("  {}", l)); } }
+                    if !err.is_empty() { for l in err.lines() { app.push_output(&format!("  [E] {}", l)); } }
+                }
+                Ok(None) => {
+                    let stdout_pipe = child.stdout.take().unwrap();
+                    let stderr_pipe = child.stderr.take().unwrap();
+                    let stdin_pipe = child.stdin.take().unwrap();
+
+                    let pid_label = pid;
+                    // stdout 实时推送线程
+                    std::thread::spawn(move || {
+                        use std::io::{BufRead, BufReader};
+                        let reader = BufReader::new(stdout_pipe);
+                        for line in reader.lines() {
+                            match line {
+                                Ok(text) => {
+                                    crate::ai::types::send_ai_message_raw(
+                                        &format!("[bg:{}] {}", pid_label, text)
+                                    );
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        crate::ai::types::send_ai_message_raw(
+                            &format!("[bg:{}] ── 进程输出流结束 ──", pid_label)
+                        );
+                        crate::ai::globals::bg_cleanup(pid_label);
+                    });
+                    // stderr 实时推送线程
+                    std::thread::spawn(move || {
+                        use std::io::{BufRead, BufReader};
+                        let reader = BufReader::new(stderr_pipe);
+                        for line in reader.lines() {
+                            match line {
+                                Ok(text) => {
+                                    crate::ai::types::send_ai_message_raw(
+                                        &format!("[bg:{} ERR] {}", pid_label, text)
+                                    );
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+
+                    crate::ai::globals::bg_cleanup_dead();
+                    {
+                        let map = crate::ai::globals::bg_proc_map();
+                        let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.contains_key(&pid) { guard.remove(&pid); }
+                        guard.insert(pid, crate::ai::globals::BgProcState {
+                            child,
+                            command: command.to_string(),
+                            started: ts_display.clone(),
+                        });
+                        let mut sguard = crate::ai::globals::bg_stdin_map()
+                            .lock().unwrap_or_else(|e| e.into_inner());
+                        sguard.remove(&pid);
+                        sguard.insert(pid, stdin_pipe);
+                    }
+
+                    app.push_output(&format!("[+] PID:{} | 状态:运行中 | 启动:{}", pid, ts_display));
+                    app.push_output(&format!("    命令: {}", command));
+                    app.push_output(&format!("[*] exec_list 查看 | exec_kill {} 终止 | exec_send {} <文本> 发送stdin", pid, pid));
+                }
+                Err(e) => app.push_output(&format!("[!] wait错误: {}", e)),
+            }
+        }
+        Err(e) => app.push_output(&format!("[!] 启动失败: {}", e)),
+    }
+}
+
+fn cmd_exec_list(app: &mut App) {
+    crate::ai::globals::bg_cleanup_dead();
+    let map = crate::ai::globals::bg_proc_map();
+    let mut guard = match map.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+
+    if guard.is_empty() {
+        app.push_output("[*] 没有运行中的后台进程");
+        return;
+    }
+
+    app.push_output(&format!("═══ 后台进程 ({}个) ═══", guard.len()));
+    let pids: Vec<u32> = guard.keys().copied().collect();
+    for pid in pids {
+        if let Some(state) = guard.get_mut(&pid) {
+            let alive = match state.child.try_wait() {
+                Ok(None) => "运行中",
+                Ok(Some(s)) => {
+                    let code = s.code().unwrap_or(-1);
+                    // 进程已退出 — 标记清理
+                    drop(guard);
+                    crate::ai::globals::bg_cleanup(pid);
+                    app.push_output(&format!("  PID:{} — 已退出(退出码:{}) — 已自动清理", pid, code));
+                    return;
+                }
+                Err(_) => "未知",
+            };
+            app.push_output(&format!("  PID:{} | {} | 启动:{} | {}", pid, alive, state.started, state.command));
+        }
+    }
+    app.push_output("[*] exec_kill <PID> 终止 | exec_send <PID> <文本> 发送stdin");
+}
+
+fn cmd_exec_kill(app: &mut App, pid: u32) {
+    let map = crate::ai::globals::bg_proc_map();
+    let guard = match map.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    if !guard.contains_key(&pid) {
+        app.push_output(&format!("[!] PID:{} 不在后台进程列表中", pid));
+        return;
+    }
+    drop(guard);
+    crate::ai::globals::bg_cleanup(pid);
+    app.push_output(&format!("[+] PID:{} 已终止并清理", pid));
+}
+
+fn cmd_exec_send(app: &mut App, pid: u32, input: &str) {
+    let stdin_map = crate::ai::globals::bg_stdin_map();
+    let mut guard = match stdin_map.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    match guard.get_mut(&pid) {
+        Some(stdin) => {
+            use std::io::Write;
+            match writeln!(stdin, "{}", input) {
+                Ok(_) => app.push_output(&format!("[+] 已发送到 PID:{}", pid)),
+                Err(e) => app.push_output(&format!("[!] 发送失败: {}", e)),
+            }
+        }
+        None => app.push_output(&format!("[!] PID:{} 不存在或无stdin管道 (进程可能在exec_bg之前启动)", pid)),
+    }
 }
 
 fn cmd_edit(app: &mut App, arg: &Option<String>) {

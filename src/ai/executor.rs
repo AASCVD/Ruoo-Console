@@ -6,6 +6,7 @@ use crate::ai::types::{AiPermLevel, get_terminal_output_text};
 use crate::ai::permissions::check_tool_perm;
 use crate::ai::globals::{CLEAR_HISTORY_FLAG, TOOL_ABORT_FLAG, global_plugin_mgr, global_cmd_registry};
 use crate::ai::{with_global_cmd_registry, clear_all_cache, validate_shell_command, send_ai_message, send_ai_message_raw};
+use chrono::Local;
 pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
     let args: Value = match serde_json::from_str(args_json) {
         Ok(v) => v,
@@ -1739,6 +1740,250 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
 
 
 
+        // ═══ 后台进程管理 (实时输出+stdin注入+无超时) ═══
+        "exec_bg" => {
+            if let Err(e) = check_tool_perm(AiPermLevel::Dangerous, "exec_bg") { return e; }
+            let command = s("command");
+            if command.is_empty() {
+                return "[!] 用法: exec_bg <命令> [shell] — 后台启动, 实时输出推送终端, 返回PID\n[*] 例: exec_bg \"python -m http.server 8080\" cmd".into();
+            }
+
+            if let Err(e) = validate_shell_command(&command) {
+                return format!("[!] 命令被安全策略拦截: {}\n[*] 提示: 请将命令拆分或使用参数数组形式", e);
+            }
+
+            let shell = s("shell").to_lowercase();
+            #[cfg(windows)]
+            let (shell_cmd, shell_arg) = {
+                if shell == "powershell" || shell == "ps" {
+                    ("powershell", "-Command")
+                } else {
+                    ("cmd", "/C")
+                }
+            };
+
+            #[cfg(not(windows))]
+            let (shell_cmd, shell_arg) = {
+                match shell.as_str() {
+                    "bash" => ("bash", "-c"),
+                    "sh" => ("sh", "-c"),
+                    _ => ("sh", "-c"),
+                }
+            };
+
+            let ts_full = Local::now().format("%Y%m%d_%H%M%S").to_string();
+            let ts_display = Local::now().format("%H:%M:%S").to_string();
+
+            let mut cmd = std::process::Command::new(shell_cmd);
+            cmd.args([shell_arg, &command]);
+            cmd.stdin(std::process::Stdio::piped());
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+                const DETACHED_PROCESS: u32 = 0x00000008;
+                cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+            }
+
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::process::CommandExt;
+                cmd.process_group(0);
+            }
+
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    let pid = child.id();
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            let code = status.code().unwrap_or(-1);
+                            let mut out = String::new();
+                            let mut err = String::new();
+                            use std::io::Read;
+                            if let Some(mut s) = child.stdout.take() { let _ = s.read_to_string(&mut out); }
+                            if let Some(mut s) = child.stderr.take() { let _ = s.read_to_string(&mut err); }
+                            let mut result = format!("[!] 启动失败: 进程立即退出 (退出码:{}) | PID:{}", code, pid);
+                            if !out.is_empty() { result.push_str(&format!("\nSTDOUT: {}", out.trim())); }
+                            if !err.is_empty() { result.push_str(&format!("\nSTDERR: {}", err.trim())); }
+                            result
+                        }
+                        Ok(None) => {
+                            // ★ 进程运行中 — 启动实时输出线程
+                            let stdout_pipe = child.stdout.take().unwrap();
+                            let stderr_pipe = child.stderr.take().unwrap();
+                            let stdin_pipe = child.stdin.take().unwrap();
+                            let pid_label = pid;
+
+                            // stdout → TUI 实时推送 (行模式) + 退出自动清理
+                            std::thread::spawn(move || {
+                                use std::io::{BufRead, BufReader};
+                                let reader = BufReader::new(stdout_pipe);
+                                for line in reader.lines() {
+                                    match line {
+                                        Ok(text) => {
+                                            crate::ai::types::send_ai_message_raw(
+                                                &format!("[bg:{}] {}", pid_label, text)
+                                            );
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                crate::ai::types::send_ai_message_raw(
+                                    &format!("[bg:{}] ── 进程输出流结束, 自动清理 ──", pid_label)
+                                );
+                                crate::ai::globals::bg_cleanup(pid_label);
+                            });
+
+                            // stderr → TUI 实时推送
+                            std::thread::spawn(move || {
+                                use std::io::{BufRead, BufReader};
+                                let reader = BufReader::new(stderr_pipe);
+                                for line in reader.lines() {
+                                    match line {
+                                        Ok(text) => {
+                                            crate::ai::types::send_ai_message_raw(
+                                                &format!("[bg:{} ERR] {}", pid_label, text)
+                                            );
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            });
+
+                            // ★ 存入全局管理器 (先清理僵尸进程 + 同PID旧记录)
+                            {
+                                crate::ai::globals::bg_cleanup_dead();
+                                let map = crate::ai::globals::bg_proc_map();
+                                let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+                                // 移除可能存在的同PID旧记录 (PID复用)
+                                if guard.contains_key(&pid) {
+                                    guard.remove(&pid);
+                                }
+                                guard.insert(pid, crate::ai::globals::BgProcState {
+                                    child,
+                                    command: command.clone(),
+                                    started: ts_full.clone(),
+                                });
+                                // stdin 单独存储
+                                let mut sguard = crate::ai::globals::bg_stdin_map()
+                                    .lock().unwrap_or_else(|e| e.into_inner());
+                                sguard.remove(&pid); // 清理旧stdin
+                                sguard.insert(pid, stdin_pipe);
+                            }
+
+                            let mode = if cfg!(windows) { "脱离控制台+新进程组" } else { "setsid新会话" };
+                            format!(
+                                "PID:{} | 状态:运行中 | 启动:{} | 模式:{}\n  命令: {}\n  [*] 实时输出已推送到终端 — 用 exec_send {} \"<输入>\" 发送stdin\n  [*] exec_list 查看所有后台进程 | exec_kill {} 终止",
+                                pid, ts_display, mode, command, pid, pid
+                            )
+                        }
+                        Err(e) => format!("PID:{} | 状态:未知(wait错误:{}) | 启动:{} | 命令:{}", pid, e, ts_display, command),
+                    }
+                }
+                Err(e) => format!("[!] 后台启动失败: {}", e),
+            }
+        }
+
+        "exec_send" => {
+            if let Err(e) = check_tool_perm(AiPermLevel::Dangerous, "exec_send") { return e; }
+            let pid_str = s("pid");
+            let input = s("input");
+            if pid_str.is_empty() || input.is_empty() {
+                return "[!] 用法: exec_send <PID> <输入文本> — 向后台进程发送stdin\n[*] 例: exec_send 45678 \"stop\"".into();
+            }
+            let pid: u32 = match pid_str.parse() {
+                Ok(p) => p,
+                Err(_) => return format!("[!] 无效PID: {}", pid_str),
+            };
+            let stdin_map = crate::ai::globals::bg_stdin_map();
+            let mut guard = stdin_map.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.get_mut(&pid) {
+                Some(stdin_pipe) => {
+                    use std::io::Write;
+                    match writeln!(stdin_pipe, "{}", input) {
+                        Ok(_) => {
+                            let _ = stdin_pipe.flush();
+                            format!("[+] PID:{} stdin ← \"{}\"", pid, input)
+                        }
+                        Err(e) => format!("[!] PID:{} 写入stdin失败: {} (进程可能已退出)", pid, e),
+                    }
+                }
+                None => format!("[!] PID:{} 未找到 (进程不在管理器中, 可能已退出)", pid),
+            }
+        }
+
+        "exec_list" => {
+            if let Err(e) = check_tool_perm(AiPermLevel::Safe, "exec_list") { return e; }
+            // ★ 先清理僵尸进程
+            crate::ai::globals::bg_cleanup_dead();
+            let map = crate::ai::globals::bg_proc_map();
+            let guard = map.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_empty() {
+                return "[*] 无运行中的后台进程".into();
+            }
+            let mut lines = vec![];
+            for (&pid, state) in guard.iter() {
+                let alive = bg_check_alive(pid as u64);
+                let status = if alive { "存活" } else { "已退出" };
+                lines.push(format!(
+                    "  PID:{} [{}] {} | 启动:{}",
+                    pid, status, state.command, state.started
+                ));
+            }
+            format!("═══ 后台进程 ({}个) ═══\n{}\n  [*] exec_send <PID> \"text\" 发送stdin | exec_kill <PID> 终止", 
+                guard.len(), lines.join("\n"))
+        }
+
+        "exec_kill" => {
+            if let Err(e) = check_tool_perm(AiPermLevel::Dangerous, "exec_kill") { return e; }
+            let pid_str = s("pid");
+            if pid_str.is_empty() {
+                return "[!] 用法: exec_kill <PID> — 终止后台进程 (强制)".into();
+            }
+            let pid: u32 = match pid_str.parse() {
+                Ok(p) => p,
+                Err(_) => return format!("[!] 无效PID: {}", pid_str),
+            };
+
+            // 从全局管理器 kill + wait (带超时)
+            let killed_via_mgr = {
+                let map = crate::ai::globals::bg_proc_map();
+                let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(mut state) = guard.remove(&pid) {
+                    let _ = state.child.kill();
+                    // 用 try_wait 循环 + 短暂超时替代永久 wait
+                    let max_wait = std::time::Duration::from_secs(3);
+                    let start = std::time::Instant::now();
+                    loop {
+                        match state.child.try_wait() {
+                            Ok(Some(_)) | Err(_) => break,
+                            Ok(None) if start.elapsed() >= max_wait => break,
+                            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if killed_via_mgr {
+                // 清理 stdin
+                crate::ai::globals::bg_cleanup(pid);
+                format!("[+] PID:{} — 已终止并清理", pid)
+            } else {
+                // 回退到系统级 kill
+                match bg_kill_process(pid) {
+                    Ok(msg) => format!("[+] PID:{} — {} (系统级终止)", pid, msg),
+                    Err(e) => format!("[!] PID:{} — {}", pid, e),
+                }
+            }
+        }
+
         // ═══ AI 辅助 ═══
         "ai_message" => {
             let message = s("message");
@@ -1895,3 +2140,63 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
         format!("{}\n{}", warnings.join("\n"), result)
     }
 }
+
+// ═══ exec_bg 辅助函数 ═══
+
+fn bg_check_alive(pid: u64) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, GetExitCodeProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        use windows_sys::Win32::Foundation::CloseHandle;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+            if handle.is_null() { return false; }
+            let mut exit_code: u32 = 0;
+            let ret = GetExitCodeProcess(handle, &mut exit_code);
+            CloseHandle(handle);
+            ret != 0 && exit_code == 259 // STILL_ACTIVE
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // Unix: kill(pid, 0) 检测进程是否存在
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+}
+
+fn bg_kill_process(pid: u32) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+        use windows_sys::Win32::Foundation::CloseHandle;
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if handle.is_null() {
+                return Err("无法打开进程(可能已退出或权限不足)".into());
+            }
+            let ret = TerminateProcess(handle, 1);
+            CloseHandle(handle);
+            if ret == 0 {
+                Err("终止失败(权限不足?)".into())
+            } else {
+                Ok("已终止".into())
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        unsafe {
+            if libc::kill(pid as i32, libc::SIGTERM) == 0 {
+                Ok("已发送SIGTERM".into())
+            } else {
+                Err("发送SIGTERM失败".into())
+            }
+        }
+    }
+}
+
+

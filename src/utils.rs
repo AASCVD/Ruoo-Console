@@ -225,12 +225,22 @@ pub fn xor_str(text: &str, key: &str) -> String {
 
 // ── 模糊匹配建议 ──
 pub fn fuzzy_match(input: &str) -> Vec<String> {
-    let commands = [
-        "help","clear","status","banner","scan","whois","dns","ssl","sub",
-        "probe","geoip","maclookup","subnet","payload","shell","webshell",
-        "hash","hashid","encode","decode","rot13","urlencode","urldecode",
-        "morse","jwt","passwd","sysinfo","netstat","exec","save","exit","quit",
-    ];
+    // v10.0: 动态读取 mod_meta 作为唯一真相源，不再硬编码过时列表
+    use std::sync::LazyLock;
+    use std::collections::HashSet;
+    static FUZZY_CMDS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+        let mut set: HashSet<&str> = HashSet::new();
+        for (name, _syntax, _desc, _cat) in crate::commands::mod_meta::all_commands() {
+            let base = name.split(|c: char| c == '/' || c == ' ').next().unwrap_or(name).trim();
+            if !base.is_empty() && !base.starts_with('&') {
+                set.insert(base);
+            }
+        }
+        let mut v: Vec<&str> = set.into_iter().collect();
+        v.sort();
+        v
+    });
+    let commands: &[&str] = &FUZZY_CMDS;
     commands.iter()
         .filter(|c| c.starts_with(input) || (input.len() >= 2 && c.contains(input)))
         .take(3)

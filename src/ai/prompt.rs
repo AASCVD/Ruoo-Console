@@ -20,6 +20,7 @@ const DEFAULT_SYSTEM_PROMPT: &str = r#"你是 RUOO-CONSOLE 的内置 AI 助手 "
 6. 脚本执行: script_run 执行.ruoo脚本,支持权限沙箱+插件+驱动
 7. 内核驱动: sysload 加载.sys/.ko内核驱动(需管理员/root + 谨慎!)
 8. 系统命令: exec_cmd 执行cmd/PowerShell/bash命令(perm 5, 超时可配: config set exec_timeout_ms)
+8b. 后台命令: exec_bg 无超时后台执行命令, spawn后立即返回PID (perm 5, 适用于启动服务器等长时进程)
 9. 专业Rust工具编写：真实编写各种类型工具
 
 ## ⛔ 输出格式铁律 — 违反将导致输出乱码！
@@ -51,7 +52,7 @@ const DEFAULT_SYSTEM_PROMPT: &str = r#"你是 RUOO-CONSOLE 的内置 AI 助手 "
 - 修改代码之前记得备份
 
 ## 特殊规则
-- 不要用exec-cmd打开另一个终端这种弱智操作，终端有登录系统，exec-cmd会直接卡住。
+- 不要用exec_cmd打开另一个终端，终端有登录系统，exec_cmd会直接卡住。启动服务器等长时进程请用exec_bg (无超时, spawn后立即返回PID)。
 - 不要在工作目录乱扔垃圾，备份请放backup，垃圾文件请放junk files，临时文件请放temporary files，结果请放result
 
 ## 工具编写
@@ -260,6 +261,10 @@ pub fn build_tools() -> Vec<Value> {
         t0!("kernel_backend_info", "查看内核驱动后端信息 — 当前后端/平台/支持特性"),
         t3!("kernel_scaffold", "生成完整驱动项目骨架 — 源码+Makefile/build.bat+README一键创建", "name", "string", "驱动项目名", "output_dir", "string", "输出目录路径", "platform", "string", "目标平台(windows/linux)"),
         t2!("exec_cmd", "⚡【执行系统命令】— Windows(cmd /C) / Linux(sh -c)。输出stdout+stderr+退出码。超时可配(默认120s, config set exec_timeout_ms)。仅perm 5可用！", "command", "string", "要执行的命令(cargo build/dir/git/ipconfig等)", "shell", "string", "Shell选择: cmd/powershell/bash/sh(可选,默认自动)"),
+        t2!("exec_bg", "【后台执行系统命令(无超时)】— spawn后立即返回PID+日志路径, 进程独立运行不受超时限制。stdout/stderr自动落盘到log/bg/。适用于启动服务器/长期任务。仅perm 5可用！", "command", "string", "要执行的命令(python server/nginx/node等)", "shell", "string", "Shell选择: cmd/powershell/bash/sh(可选,默认自动)"),
+        t0!("exec_list", "列出所有后台进程 — 从log/bg/bg_procs.json读取, 含PID/命令/启动时间/存活状态/日志路径"),
+        t2!("exec_send", "向后台进程发送stdin — 例: exec_send 12345 \"stop\" 向服务器发送停止命令", "pid", "string", "进程PID", "input", "string", "要发送的文本(自动追加换行)"),
+        t1!("exec_kill", "终止后台进程 — 按PID强制终止+清理全局管理器+追踪文件", "pid", "string", "进程PID"),
 
         // ═══ 文件操作扩展 v5.9 ═══
         t2!("base64_file", "文件Base64 — 编码/解码文件到Base64", "path", "string", "文件路径", "operation", "string", "encode 或 decode"),
