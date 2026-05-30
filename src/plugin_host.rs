@@ -45,6 +45,9 @@ impl PluginHostResult {
 // ════════════════════════════════════════════════════════
 
 pub fn run_plugin_exec_mode(args: &[String]) -> ! {
+    // 标记子进程模式 — 宿主ABI函数静默无操作
+    crate::host_abi::set_subprocess_mode();
+
     // 参数解析: --plugin-exec <dll> <cmd> [--timeout <ms>]
     if args.len() < 4 {
         let result = PluginHostResult::error(
@@ -89,15 +92,28 @@ pub fn run_plugin_exec_mode(args: &[String]) -> ! {
         }
     };
 
-    // ── 步骤 3: 调用 ruoo_plugin_init ──
+    // ── 步骤 3: 调用 ruoo_plugin_init (支持 v2 HostAPI 签名) ──
     let init_code: i32 = unsafe {
-        match lib.get::<unsafe extern "C" fn() -> i32>(b"ruoo_plugin_init") {
-            Ok(func) => func(),
-            Err(e) => {
-                let result = PluginHostResult::error(
-                    format!("缺少 ruoo_plugin_init 导出: {}", e)
-                );
-                print_result_and_exit(&result, 3);
+        // v2: ruoo_plugin_init(*const HostAPI) -> i32 — 函数指针表传递
+        let v2_init = lib.get::<unsafe extern "C" fn(*const crate::host_abi::HostAPI) -> i32>(
+            b"ruoo_plugin_init\0"
+        );
+        match v2_init {
+            Ok(func) => {
+                let api = crate::host_abi::get_host_api();
+                func(api as *const crate::host_abi::HostAPI)
+            }
+            Err(_) => {
+                // v1: ruoo_plugin_init() -> i32 — 传统无参签名
+                match lib.get::<unsafe extern "C" fn() -> i32>(b"ruoo_plugin_init") {
+                    Ok(func) => func(),
+                    Err(e) => {
+                        let result = PluginHostResult::error(
+                            format!("缺少 ruoo_plugin_init 导出: {}", e)
+                        );
+                        print_result_and_exit(&result, 3);
+                    }
+                }
             }
         }
     };

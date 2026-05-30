@@ -30,6 +30,7 @@ mod crypto_channel;
 mod panic_guard;
 mod telemetry;
 mod plugin_host;
+mod host_abi;
 
 use chrono::Local;
 use crossterm::{
@@ -486,7 +487,7 @@ impl App {
             window_hidden: false,
             window_show_requested: None,
             is_admin: false,
-            show_right_sidebar: false,
+            show_right_sidebar: true,
             right_sidebar_mode: RightSidebarMode::Dashboard,
             telemetry_cache: None,
             telemetry_cache_tick: 0,
@@ -497,7 +498,9 @@ impl App {
         // ★ 过滤 \r 防止 ratatui 渲染错位: 孤立 \r(0x0D)会使Paragraph光标归零,
         //    后续文本从列0覆盖写入, 导致动态"..."覆盖行首时间戳等
         // ★ BUG-FIX: 按\n拆分为多行,每行独立push — ratatui Line不处理内嵌\n
-        for line in msg.split('\n') {
+        // ★ v7.2: 使用 lines() 替代 split('\n') — lines() 不产生尾随空行
+        //    ("text\n".lines()→["text"], 而 split('\n')→["text", ""])
+        for line in msg.lines() {
             self.output.push(line.replace('\r', ""));
 
             // ★ v4.5: 输出上限500行 — 超出行静默丢弃, 不再写文件
@@ -2217,14 +2220,13 @@ fn main() -> io::Result<()> {
             if !active.is_empty() {
                 // 移除旧的进度条输出行
                 app.output.retain(|l| !l.starts_with("[▌"));
-                // 注入新的进度条行
-                let mut lines = vec!["".to_string()];
+                // 注入新的进度条行 (使用[▌]前缀标记, 便于cleanup)
+                let mut lines: Vec<String> = Vec::new();
                 lines.push(format!("[▌] ═══ 进度 ({}插件) ═══", active.len()));
                 for bar in &active {
                     lines.push(format!("[▌] {}", bar.render_line()));
                 }
                 lines.push("[▌] ══════════════════════".to_string());
-                lines.push("".to_string());
                 for line in lines {
                     app.output.push(line);
                 }

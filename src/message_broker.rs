@@ -335,16 +335,14 @@ impl MessageBroker {
 // 全局单例
 // ═══════════════════════════════════════════════════════
 
-static GLOBAL_BROKER: std::sync::LazyLock<Arc<MessageBroker>> =
-    std::sync::LazyLock::new(|| Arc::new(MessageBroker::new()));
+static GLOBAL_BROKER: std::sync::OnceLock<Arc<MessageBroker>> = std::sync::OnceLock::new();
 
-pub fn set_global_broker(_broker: Arc<MessageBroker>) {
-    // 无法直接设置LazyLock，使用内部可变性
-    let _ = &*GLOBAL_BROKER; // 确保已初始化
+pub fn set_global_broker(broker: Arc<MessageBroker>) {
+    let _ = GLOBAL_BROKER.set(broker);
 }
 
 pub fn global_broker() -> Option<Arc<MessageBroker>> {
-    Some(GLOBAL_BROKER.clone())
+    GLOBAL_BROKER.get().cloned()
 }
 
 /// 推送消息到 TUI 输出
@@ -445,6 +443,14 @@ pub unsafe extern "C" fn ruoo_message_push(
     if plugin_name.is_null() || text.is_null() { return -1; }
     let name = CStr::from_ptr(plugin_name).to_string_lossy();
     let msg = CStr::from_ptr(text).to_string_lossy();
+    // 子进程模式: 通过stderr转发到父进程TUI
+    if crate::host_abi::is_subprocess() {
+        crate::host_abi::subprocess_stderr_write(
+            "RMSG:push",
+            &format!("{}|{}", name, msg)
+        );
+        return 0;
+    }
     push_message(&name, &msg);
     0
 }
@@ -457,6 +463,14 @@ pub unsafe extern "C" fn ruoo_message_update(
     if tag.is_null() || text.is_null() { return -1; }
     let t = CStr::from_ptr(tag).to_string_lossy();
     let msg = CStr::from_ptr(text).to_string_lossy();
+    // 子进程模式: 通过stderr转发到父进程TUI
+    if crate::host_abi::is_subprocess() {
+        crate::host_abi::subprocess_stderr_write(
+            "RMSG:update",
+            &format!("{}|{}", t, msg)
+        );
+        return 0;
+    }
     update_tagged_line(&t, &msg);
     0
 }
@@ -469,6 +483,14 @@ pub unsafe extern "C" fn ruoo_message_tagged(
     if tag.is_null() || text.is_null() { return -1; }
     let t = CStr::from_ptr(tag).to_string_lossy();
     let msg = CStr::from_ptr(text).to_string_lossy();
+    // 子进程模式: 通过stderr转发到父进程TUI
+    if crate::host_abi::is_subprocess() {
+        crate::host_abi::subprocess_stderr_write(
+            "RMSG:tagged",
+            &format!("{}|{}", t, msg)
+        );
+        return 0;
+    }
     push_tagged_line(&t, &msg);
     0
 }
@@ -479,6 +501,14 @@ pub unsafe extern "C" fn ruoo_message_remove(
 ) -> i32 {
     if tag.is_null() { return -1; }
     let t = CStr::from_ptr(tag).to_string_lossy();
+    // 子进程模式: 通过stderr转发到父进程TUI
+    if crate::host_abi::is_subprocess() {
+        crate::host_abi::subprocess_stderr_write(
+            "RMSG:remove",
+            &t
+        );
+        return 0;
+    }
     remove_tagged_line(&t);
     0
 }

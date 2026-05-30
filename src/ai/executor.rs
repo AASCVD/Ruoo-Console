@@ -935,12 +935,16 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
 
                     let reg_result = crate::plugin::try_register_from_file(&path, &name, cmd_reg);
 
-                    let perms = crate::script::PermissionSet::all();
-                    let ping_result = mgr.call(&name, "ping", &perms, 5000)
-                        .unwrap_or_else(|e| format!("(ping失败但插件已加载: {})", e));
+                    // v4.1 fix: 移除子进程ping测试(每次spawn耗时100-500ms)
+                    // 插件init成功=可用, 无需额外验证
+                    let ping_result = if mgr.is_loaded(&name) {
+                        "插件就绪 (v7.1子进程隔离)".to_string()
+                    } else {
+                        "(状态异常)".to_string()
+                    };
 
                     let mut out = format!(
-                        "[+] 插件已加载: {}\n  {} | ping → {}\n  [!] ⚠ 原生代码可完全突破沙箱 — 仅信任审计过的插件",
+                        "[+] 插件已加载: {}\n  {} | 状态: {}\n  [!] ⚠ 原生代码可完全突破沙箱 — 仅信任审计过的插件",
                         name, msg, ping_result
                     );
 

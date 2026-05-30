@@ -172,18 +172,41 @@ impl MultiProgressManager {
         }
     }
 
-    /// 完成进度条
+    /// 完成进度条 — 同时推送完成消息到TUI
     pub fn finish(&self, handle: &str) -> Result<(), String> {
-        let mut bars = self.bars.lock();
-        match bars.get_mut(handle) {
-            Some(bar) => {
-                bar.current = bar.total;
-                bar.finished = true;
-                bar.active = false;
-                bar.last_update = Instant::now();
-                Ok(())
+        let (plugin_name, done_msg) = {
+            let mut bars = self.bars.lock();
+            match bars.get_mut(handle) {
+                Some(bar) => {
+                    bar.current = bar.total;
+                    bar.finished = true;
+                    bar.active = false;
+                    bar.last_update = Instant::now();
+                    let msg = format!(
+                        "插件[{}]: 100%: 来自{}插件",
+                        bar.label,
+                        bar.plugin_name
+                    );
+                    (bar.plugin_name.clone(), msg)
+                }
+                None => return Err(format!("进度条不存在: {}", handle)),
             }
-            None => Err(format!("进度条不存在: {}", handle)),
+        };
+        // ★ 锁外推送消息，避免死锁
+        Self::push_done_message(&plugin_name, &done_msg);
+        Ok(())
+    }
+
+    /// 推送完成消息到 message_broker (如果可用)
+    fn push_done_message(plugin_name: &str, msg: &str) {
+        if let Some(ref broker) = crate::message_broker::global_broker() {
+            broker.send_with_limit(
+                plugin_name,
+                crate::message_broker::BrokerMsg::Append {
+                    plugin_name: plugin_name.to_string(),
+                    text: msg.to_string(),
+                },
+            );
         }
     }
 
@@ -194,16 +217,35 @@ impl MultiProgressManager {
     }
 
     /// 清理过期进度条 (超过stale_timeout未更新)
+    /// ★ v5.1 修复: 已完成进度条 3 秒后清除 (原30秒太慢)
+    ///             清除时推送完成消息到 TUI
     pub fn cleanup_stale(&self) -> usize {
         let mut bars = self.bars.lock();
         let timeout = Duration::from_secs(self.stale_timeout_secs);
         let now = Instant::now();
-        let stale: Vec<String> = bars.iter()
-            .filter(|(_, b)| !b.active && now.duration_since(b.last_update) > Duration::from_secs(30))
-            .map(|(k, _)| k.clone())
+        // 已完成进度条: 3 秒后清理 (给用户时间看到完成状态)
+        let finished_timeout = Duration::from_secs(3);
+        let stale: Vec<(String, String, String)> = bars.iter()
+            .filter(|(_, b)| !b.active && now.duration_since(b.last_update) > finished_timeout)
+            .map(|(k, b)| (k.clone(), b.plugin_name.clone(), b.label.clone()))
             .collect();
         let count = stale.len();
-        for h in &stale { bars.remove(h); }
+        for (h, pn, label) in &stale {
+            // 推送完成消息到 TUI
+            let done_msg = format!("插件[{}]: 100%: 来自{}插件", label, pn);
+            drop(bars); // 释放锁再发送消息，避免死锁
+            if let Some(ref broker) = crate::message_broker::global_broker() {
+                broker.send_with_limit(
+                    pn,
+                    crate::message_broker::BrokerMsg::Append {
+                        plugin_name: pn.clone(),
+                        text: done_msg,
+                    },
+                );
+            }
+            bars = self.bars.lock();
+            bars.remove(h);
+        }
         // 也清理超时的活跃进度条
         let stale_active: Vec<String> = bars.iter()
             .filter(|(_, b)| b.active && now.duration_since(b.last_update) > timeout)
@@ -304,6 +346,10 @@ pub fn global_progress() -> Option<Arc<MultiProgressManager>> {
     GLOBAL_PROGRESS.get().cloned()
 }
 
+pub fn global_progress_manager() -> Option<Arc<MultiProgressManager>> {
+    global_progress()
+}
+
 // ═══════════════════════════════════════════════════════
 // C ABI 导出 — 供插件 DLL/SO 直接调用
 //
@@ -347,6 +393,16 @@ pub unsafe extern "C" fn ruoo_progress_create(
     };
     let lbl = CStr::from_ptr(label).to_string_lossy();
 
+    // 子进程模式: 通过stderr转发进度到父进程TUI
+    if crate::host_abi::is_subprocess() {
+        crate::host_abi::subprocess_stderr_write(
+            "RPP:create",
+            &format!("{}|{}|{}|{}", plugin, id, lbl, total)
+        );
+        let handle = format!("{}::{}", plugin, id);
+        return CString::new(handle).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut());
+    }
+
     let mgr = match global_progress() {
         Some(m) => m,
         None => return std::ptr::null_mut(),
@@ -379,6 +435,15 @@ pub unsafe extern "C" fn ruoo_progress_update(
         CStr::from_ptr(message).to_string_lossy().to_string()
     };
 
+    // 子进程模式: 通过stderr转发到父进程TUI
+    if crate::host_abi::is_subprocess() {
+        crate::host_abi::subprocess_stderr_write(
+            "RPP:update",
+            &format!("{}|{}|{}", h, current, msg)
+        );
+        return 0;
+    }
+
     let mgr = match global_progress() {
         Some(m) => m,
         None => return -1,
@@ -403,6 +468,15 @@ pub unsafe extern "C" fn ruoo_progress_set_total(
         Err(_) => return -1,
     };
 
+    // 子进程模式: 通过stderr转发到父进程TUI
+    if crate::host_abi::is_subprocess() {
+        crate::host_abi::subprocess_stderr_write(
+            "RPP:set_total",
+            &format!("{}|{}", h, total)
+        );
+        return 0;
+    }
+
     let mgr = match global_progress() {
         Some(m) => m,
         None => return -1,
@@ -425,6 +499,15 @@ pub unsafe extern "C" fn ruoo_progress_finish(
         Ok(s) => s,
         Err(_) => return -1,
     };
+
+    // 子进程模式: 通过stderr转发到父进程TUI
+    if crate::host_abi::is_subprocess() {
+        crate::host_abi::subprocess_stderr_write(
+            "RPP:finish",
+            h
+        );
+        return 0;
+    }
 
     let mgr = match global_progress() {
         Some(m) => m,

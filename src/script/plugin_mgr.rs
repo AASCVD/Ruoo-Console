@@ -278,27 +278,7 @@ impl PluginManager {
         self.hotload_inner(name, &path)
     }
 
-    /// v6.2: 调用插件 — 后台线程执行 + 超时保护 + 熔断器
-    ///
-    /// 流程:
-    ///   1. 权限预检查 (脚本权限 vs 插件声明权限)
-    ///   2. 热加载检测 (watch-plugins 模式)
-    ///   3. 熔断器检查 (防止反复崩溃)
-    ///   4. spawn 独立线程执行 ruoo_plugin_exec
-    ///   5. 主线程 join 等待 (带超时)
-    ///   6. 调用 ruoo_plugin_free_result 释放内存
-    pub fn call(
-        &mut self,
-        name: &str,
-        command: &str,
-        script_perms: &PermissionSet,
-        timeout_ms: u64,
-    ) -> Result<String, String> {
-        // v7.1: 所有插件执行统一走子进程隔离 — ACCESS_VIOLATION/STACK_OVERFLOW 不再影响主进程
-        self.call_subprocess(name, command, script_perms, timeout_ms)
-    }
-
-    /// 无超时调用 (兼容旧接口, v7.1: 走子进程)
+    /// 无超时调用 (兼容旧接口, v7.1: 统一走子进程)
     #[allow(dead_code)]
     pub fn call_default(
         &mut self,
@@ -306,7 +286,7 @@ impl PluginManager {
         command: &str,
         script_perms: &PermissionSet,
     ) -> Result<String, String> {
-        self.call_subprocess(name, command, script_perms, 30_000) // 默认30秒超时
+        self.call_subprocess(name, command, script_perms, 30_000)
     }
 
     /// 卸载插件 v7.1: 子进程架构 — 无进程内DLL, 直接移除
@@ -573,8 +553,13 @@ impl PluginManager {
         report
     }
 
-    /// 安全调用插件 v7.1: 全部走子进程, 崩溃不传播到主进程
-    pub fn call_guarded(
+    /// v7.1: 调用插件 — 子进程隔离, 100%防主进程崩溃
+    ///
+    /// ⚠ 为什么永不进程内加载:
+    ///   ACCESS_VIOLATION/STACK_OVERFLOW/UB 在进程内无法防御。
+    ///   VEH能捕获部分异常, 但栈耗尽/堆损坏时没有恢复机会。
+    ///   子进程隔离 (~100-500ms spawn开销) 是唯一安全方案。
+    pub fn call(
         &mut self,
         name: &str,
         command: &str,
@@ -745,10 +730,14 @@ impl PluginManager {
     //       通过 stdout JSON 返回结果
     //
     // 性能: 首次spawn ~50-100ms (冷启动), 后续利用OS磁盘缓存更快
-    //       对稳定性要求高的插件自动切换到此路径
+    //
+    // v4.1: stderr实时转发 — 子进程ABI调用通过stderr标记行传回父进程TUI
+    //   [RPP:create|plugin|id|label|total] → 进度条创建
+    //   [RPP:update|handle|current|msg]    → 进度条更新
+    //   [RMSG:push|plugin|text]            → 消息推送
     // ═══════════════════════════════════════════════════════════
 
-    /// 通过子进程安全调用插件 — 适用于已知会崩溃的插件
+    /// 通过子进程安全调用插件
     /// 返回 Ok(结果) 或 Err(错误消息, 含详细崩溃报告)
     pub fn call_subprocess(
         &mut self,
@@ -758,7 +747,6 @@ impl PluginManager {
         timeout_ms: u64,
     ) -> Result<String, String> {
         use std::process::{Command, Stdio, ExitStatus};
-        use std::io::Read;
         use std::time::Instant;
         #[cfg(windows)]
         use std::os::windows::process::CommandExt;
@@ -821,43 +809,71 @@ impl PluginManager {
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // Windows: CREATE_NO_WINDOW — 不弹出控制台窗口
-            // (通过 cfg 条件编译在 spawn 之前设置)
         .spawn()
             .map_err(|e| format!("无法启动插件子进程: {}", e))?;
 
-        // 5. 带超时的等待
-        let deadline = start + std::time::Duration::from_millis(timeout_ms + 10_000); // 额外10s容错
+        // 5. 后台线程: 实时读取stderr, 转发RPP/RMSG标记行到TUI
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel::<String>();
+        let stderr_pipe = child.stderr.take();
+        if let Some(stderr_pipe) = stderr_pipe {
+            let stderr_reader = std::io::BufReader::new(stderr_pipe);
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in stderr_reader.lines() {
+                    match line {
+                        Ok(l) => {
+                            let trimmed = l.trim().to_string();
+                            if !trimmed.is_empty() {
+                                let _ = stderr_tx.send(trimmed);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+
+        // 6. 带超时的等待 (v4.1: 容错从10s降至3s)
+        let deadline = start + std::time::Duration::from_millis(timeout_ms + 3_000);
         let exit_status: ExitStatus;
         let mut stdout_str = String::new();
-        let mut stderr_str = String::new();
+        let mut stderr_extra = String::new(); // 已转发到TUI的行也保留一份
 
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     exit_status = status;
-                    // 读取 stdout/stderr
-                    {
-                        let mut out: Box<dyn Read> = Box::new(child.stdout.take().unwrap());
-                        let _ = out.read_to_string(&mut stdout_str);
+                    // 读取 stdout
+                    if let Some(ref mut out) = child.stdout {
+                        let _ = std::io::Read::read_to_string(out, &mut stdout_str);
                     }
-                    {
-                        let mut err: Box<dyn Read> = Box::new(child.stderr.take().unwrap());
-                        let _ = err.read_to_string(&mut stderr_str);
+                    // 清空stderr channel剩余行
+                    while let Ok(line) = stderr_rx.try_recv() {
+                        forward_stderr_line_to_tui(name, &line);
+                        stderr_extra.push_str(&line);
+                        stderr_extra.push('\n');
                     }
                     break;
                 }
                 Ok(None) => {
+                    // 转发stderr中的标记行到TUI
+                    while let Ok(line) = stderr_rx.try_recv() {
+                        forward_stderr_line_to_tui(name, &line);
+                        stderr_extra.push_str(&line);
+                        stderr_extra.push('\n');
+                    }
+
                     if Instant::now() >= deadline {
-                        // 超时 — 杀死子进程
                         let _ = child.kill();
                         let _ = child.wait();
-                        // 读取剩余输出
                         if let Some(ref mut out) = child.stdout {
-                            let _ = out.read_to_string(&mut stdout_str);
+                            let _ = std::io::Read::read_to_string(out, &mut stdout_str);
                         }
-                        if let Some(ref mut err) = child.stderr {
-                            let _ = err.read_to_string(&mut stderr_str);
+                        // 清空剩余stderr
+                        while let Ok(line) = stderr_rx.try_recv() {
+                            forward_stderr_line_to_tui(name, &line);
+                            stderr_extra.push_str(&line);
+                            stderr_extra.push('\n');
                         }
 
                         let elapsed = start.elapsed().as_millis();
@@ -866,13 +882,10 @@ impl PluginManager {
                              插件: {} v{}\n\
                              命令: {}\n\
                              超时: {}ms (限制 {}ms)\n\
-                             状态: 子进程已终止, 主进程不受影响\n\
-                             stderr: {}",
-                            name, ver, command, elapsed, timeout_ms,
-                            if stderr_str.is_empty() { "(无)" } else { &stderr_str }
+                             状态: 子进程已终止, 主进程不受影响",
+                            name, ver, command, elapsed, timeout_ms
                         );
 
-                        // 更新熔断器
                         if let Some(info) = self.loaded.get_mut(name) {
                             info.crash_count += 1;
                             info.circuit_breaker.record_failure(&err_msg, command);
@@ -881,7 +894,7 @@ impl PluginManager {
 
                         return Err(err_msg);
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 Err(e) => {
                     return Err(format!("子进程通信失败: {}", e));
@@ -937,7 +950,7 @@ impl PluginManager {
                          stderr: {}\n\
                          耗时: {}ms",
                         name, ver, command, exit_code, hint,
-                        if stderr_str.is_empty() { "(无)" } else { &stderr_str },
+                        if stderr_extra.is_empty() { "(无)" } else { &stderr_extra },
                         elapsed
                     )
                 }
@@ -960,7 +973,7 @@ impl PluginManager {
                     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
                     let _ = writeln!(f, "[{}] [SUBPROCESS CRASH] plugin={} cmd={} | exit=0x{:08X}",
                         ts, name, command, exit_code);
-                    let _ = writeln!(f, "  stderr: {}", stderr_str);
+                    let _ = writeln!(f, "  stderr: {}", stderr_extra);
                     let _ = f.flush();
                 }
             }
@@ -998,8 +1011,15 @@ impl PluginManager {
         }
     }
 
-    /// 智能调用 — v7.0: 默认子进程隔离, 100% 防崩溃
-    /// 线程模式(call)仅作兼容保留, 不再自动使用
+    /// v7.1 子进程隔离调用 — 唯一安全路径
+    ///
+    /// 为什么必须子进程:
+    ///   - ACCESS_VIOLATION (0xC0000005) → 进程内DLL崩溃直接杀死主进程, VEH来不及拦截
+    ///   - STACK_OVERFLOW  (0xC00000FD) → 同样, 栈耗尽时没有恢复机会
+    ///   - 未定义行为 (UB)            → Rust panic可以catch_unwind, 但UB不能
+    ///
+    /// 子进程隔离是唯一能100%保证主进程存活的方案。
+    /// 性能代价(~100-500ms spawn)远小于终端崩溃的代价。
     pub fn call_smart(
         &mut self,
         name: &str,
@@ -1007,7 +1027,7 @@ impl PluginManager {
         script_perms: &PermissionSet,
         timeout_ms: u64,
     ) -> Result<String, String> {
-        // v7.0: 直接走子进程 — 线程模式无法防御 ACCESS_VIOLATION
+        // v7.1: 统一走子进程隔离 — 永不进程内加载不可信DLL
         self.call_subprocess(name, command, script_perms, timeout_ms)
     }
 }
@@ -1095,6 +1115,71 @@ pub fn execute_plugin_ai_command(name: &str, args_json: &str) -> String {
     }
 }
 
+
+/// v4.1: 转发子进程stderr标记行到TUI输出
+fn forward_stderr_line_to_tui(_plugin_name: &str, line: &str) {
+    if !line.starts_with('[') { return; }
+
+    let inner = line.trim_start_matches('[').trim_end_matches(']');
+    if let Some((tag, payload)) = inner.split_once('|') {
+        match tag {
+            "RPP:create" => {
+                let parts: Vec<&str> = payload.splitn(4, '|').collect();
+                if parts.len() >= 4 {
+                    if let Some(pm) = crate::plugin_progress::global_progress_manager() {
+                        pm.create(parts[0], parts[1], parts[2],
+                            parts[3].parse().unwrap_or(100));
+                    }
+                }
+            }
+            "RPP:update" => {
+                let parts: Vec<&str> = payload.splitn(3, '|').collect();
+                if parts.len() >= 3 {
+                    if let Some(pm) = crate::plugin_progress::global_progress_manager() {
+                        let _ = pm.update(parts[0],
+                            parts[1].parse().unwrap_or(0), parts[2]);
+                    }
+                }
+            }
+            "RPP:finish" => {
+                if let Some(pm) = crate::plugin_progress::global_progress_manager() {
+                    let _ = pm.finish(payload);
+                }
+            }
+            "RPP:set_total" => {
+                let parts: Vec<&str> = payload.splitn(2, '|').collect();
+                if parts.len() >= 2 {
+                    if let Some(pm) = crate::plugin_progress::global_progress_manager() {
+                        let _ = pm.set_total(parts[0],
+                            parts[1].parse().unwrap_or(100));
+                    }
+                }
+            }
+            "RMSG:push" => {
+                let parts: Vec<&str> = payload.splitn(2, '|').collect();
+                if parts.len() >= 2 {
+                    crate::message_broker::push_message(parts[0], parts[1]);
+                }
+            }
+            "RMSG:update" => {
+                let parts: Vec<&str> = payload.splitn(2, '|').collect();
+                if parts.len() >= 2 {
+                    crate::message_broker::update_tagged_line(parts[0], parts[1]);
+                }
+            }
+            "RMSG:tagged" => {
+                let parts: Vec<&str> = payload.splitn(2, '|').collect();
+                if parts.len() >= 2 {
+                    crate::message_broker::push_tagged_line(parts[0], parts[1]);
+                }
+            }
+            "RMSG:remove" => {
+                crate::message_broker::remove_tagged_line(payload);
+            }
+            _ => {}
+        }
+    }
+}
 impl Drop for PluginManager {
     fn drop(&mut self) {
         let names: Vec<String> = self.loaded.keys().cloned().collect();

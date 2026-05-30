@@ -197,27 +197,38 @@ pub fn process_cmd(app: &mut App, raw: &str) {
 
             app.push_output(&format!("[plugin:{}] {} → {}", plugin_name, def.cmd, plugin_cmd));
 
-            // v9.0: 统一全局 PluginManager — TUI和AI共享同一实例
-            let perms = crate::script::PermissionSet::all();
-            // v7.0: 使用智能调用 — 首次线程模式, 崩溃后自动降级子进程
-            let call_result = {
-                let mut mgr = app.plugin_mgr.lock().unwrap();
-                mgr.call_smart(&plugin_name, &plugin_cmd, &perms, 30_000)
-            }; // MutexGuard在此释放
-            match call_result {
-                Ok(result) => {
-                    plugin_push_multiline(app, &plugin_name, &result);
-                }
-                Err(local_err) => {
-                    let msg = local_err.to_lowercase();
-                    if msg.contains("unloaded") || msg.contains("not loaded") || msg.contains("not found") {
-                        app.push_output(&format!("[!] 插件 '{}' 未加载 — 请先 plugin load {} <路径>", plugin_name, plugin_name));
-                        app.push_output("[*] 可用: plugin load <名称> <路径> → 加载并自动注册命令");
-                    } else {
-                        app.push_output(&format!("[!] 插件调用失败: {}", local_err));
+            // v7.2: 异步调用 — 不阻塞UI线程, 后台执行子进程
+            let mgr_clone = app.plugin_mgr.clone();
+            let pn = plugin_name.clone();
+            let pcmd = plugin_cmd.clone();
+            let label = format!("plugin:{} {}", pn, pcmd);
+            spawn_async_cmd(app, label, move |out| {
+                let perms = crate::script::PermissionSet::all();
+                let call_result = {
+                    let mut mgr = mgr_clone.lock().unwrap();
+                    mgr.call_smart(&pn, &pcmd, &perms, 30_000)
+                };
+                match call_result {
+                    Ok(result) => {
+                        let mut lines = result.lines();
+                        if let Some(first) = lines.next() {
+                            out.push(format!("[plugin:{}] {}", pn, first));
+                        }
+                        for line in lines {
+                            out.push(line.to_string());
+                        }
+                    }
+                    Err(local_err) => {
+                        let msg = local_err.to_lowercase();
+                        if msg.contains("unloaded") || msg.contains("not loaded") || msg.contains("not found") {
+                            out.push(format!("[!] 插件 '{}' 未加载 — 请先 plugin load {} <路径>", pn, pn));
+                            out.push("[*] 可用: plugin load <名称> <路径> → 加载并自动注册命令".to_string());
+                        } else {
+                            out.push(format!("[!] 插件调用失败: {}", local_err));
+                        }
                     }
                 }
-            }
+            });
             return;
         }
     }
@@ -1914,6 +1925,7 @@ fn cmd_plugin(app: &mut App, sub: &Option<String>, arg2: &Option<String>) {
                 mgr.soft_restart(&name, &mut app.cmd_registry)
             }; // mgr dropped here
             app.push_output(&report);
+            help::help_refresh_if_open(app); // v10.1: 刷新帮助页
         }
         // ── v7.1: 批量恢复所有故障插件 ──
         "recover-all" => {
@@ -1964,6 +1976,51 @@ fn cmd_plugin(app: &mut App, sub: &Option<String>, arg2: &Option<String>) {
             let summary = app.plugin_mgr.lock().unwrap().plugin_health_summary();
             app.push_output(&summary);
         }
+        // ── 调用 (v4.1 fix: 补充缺失的call子命令) ──
+        "call" => {
+            let args = arg2.as_deref().unwrap_or("");
+            let parts: Vec<&str> = args.splitn(2, ' ').collect();
+            if parts.is_empty() || parts[0].is_empty() {
+                app.push_output("[!] 用法: plugin call <名称> <命令>");
+                app.push_output("[*] 例: plugin call dll_crack \"dll_analyze C:\\test.dll\"");
+                return;
+            }
+            let name = parts[0].to_string();
+            let command = if parts.len() > 1 { parts[1].to_string() } else { String::new() };
+            if command.is_empty() {
+                app.push_output("[!] 用法: plugin call <名称> <命令>");
+                return;
+            }
+            // v7.2: 异步调用 — 不阻塞UI线程, 后台执行子进程
+            let mgr_clone = app.plugin_mgr.clone();
+            let label = format!("plugin:{} {}", name, command);
+            spawn_async_cmd(app, label, move |out| {
+                let perms = crate::script::PermissionSet::all();
+                let call_result = {
+                    let mut mgr = mgr_clone.lock().unwrap();
+                    mgr.call_smart(&name, &command, &perms, 30_000)
+                };
+                match call_result {
+                    Ok(result) => {
+                        let mut lines = result.lines();
+                        if let Some(first) = lines.next() {
+                            out.push(format!("[plugin:{}] {}", name, first));
+                        }
+                        for line in lines {
+                            out.push(line.to_string());
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_lowercase();
+                        if msg.contains("未加载") || msg.contains("not loaded") || msg.contains("not found") {
+                            out.push(format!("[!] 插件 '{}' 未加载 — 请先 plugin load {} <路径>", name, name));
+                        } else {
+                            out.push(format!("[!] 调用失败: {}", e));
+                        }
+                    }
+                }
+            });
+        }
         // ── 列表 ──
         "list" => {
             let details = app.plugin_mgr.lock().unwrap().list_detailed();
@@ -2004,6 +2061,7 @@ fn cmd_plugin(app: &mut App, sub: &Option<String>, arg2: &Option<String>) {
                         Ok(_) => app.push_output("  [*] 无命令声明"),
                         Err(e) => app.push_output(&format!("  [!] 命令注册: {}", e)),
                     }
+                    help::help_refresh_if_open(app); // v10.1: 刷新帮助页
                 }
                 Err(e) => app.push_output(&format!("  [!] 加载失败: {}", e)),
             }
@@ -2025,6 +2083,7 @@ fn cmd_plugin(app: &mut App, sub: &Option<String>, arg2: &Option<String>) {
             match unload_result {
                 Ok(()) => {
                     app.push_output(&format!("[+] 插件已卸载: {} (注销 {} 个命令)", name, removed));
+                    help::help_refresh_if_open(app); // v10.1: 刷新帮助页
                 }
                 Err(e) => app.push_output(&format!("[!] {}", e)),
             }
@@ -2033,7 +2092,7 @@ fn cmd_plugin(app: &mut App, sub: &Option<String>, arg2: &Option<String>) {
         _ => {
             app.push_output(&format!(
                 "[!] 未知子命令: {}\n\
-                 [*] 可用: load/unload/list/restart/recover-all/crash-recover/force-unload/health/health-all",
+                 [*] 可用: load/unload/call/list/restart/recover-all/crash-recover/force-unload/health/health-all",
                 sub
             ));
         }
