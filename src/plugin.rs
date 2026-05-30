@@ -2008,7 +2008,7 @@ mod tests {
     #[test]
     fn test_circuit_breaker_trips() {
         let mut cb = CircuitBreaker::new(3);
-        for _i in 0..3 {
+        for i in 0..3 {
             assert!(cb.allow_call());
             cb.record_failure("test error", "test_cmd");
         }

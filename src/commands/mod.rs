@@ -294,6 +294,22 @@ pub fn process_cmd(app: &mut App, raw: &str) {
         "clear" | "cls" => {
             let sub = arg1.as_deref().unwrap_or("screen");
             match sub {
+                "history" => {
+                    crate::ai::globals::CLEAR_HISTORY_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+                    app.push_output("[+] AI 对话历史已清除 — 下次对话将以全新上下文开始");
+                }
+                "cache" => {
+                    let msg = crate::ai::clear_all_cache();
+                    app.push_output(&format!("[+] {}", msg));
+                }
+                "context" => {
+                    crate::ai::globals::CLEAR_HISTORY_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let cache_msg = crate::ai::clear_all_cache();
+                    app.push_output("[+] AI 上下文已完全重置");
+                    app.push_output("  [*] 对话历史 → 已重置");
+                    app.push_output(&format!("  {}", cache_msg));
+                    app.push_output("  [*] 下次对话将使用全新上下文");
+                }
                 _ => {
                     app.output.clear();
                     app.reset_scroll();
@@ -2173,8 +2189,80 @@ fn cmd_vault(app: &mut App, sub: &Option<String>, args: &Option<String>) {
             app.push_output("  [*] 第一阶段: 输入当前密码");
             app.push_output("[*] 输入密码后按 Enter，Esc 取消");
         }
+        "ns" => {
+            let nss = vault.list_namespaces();
+            if nss.is_empty() {
+                app.push_output("[*] Vault 命名空间: (空)");
+            } else {
+                app.push_output(&format!("[*] Vault 命名空间 ({}):", nss.len()));
+                for ns_name in &nss {
+                    let count = vault.list_keys(ns_name).len();
+                    app.push_output(&format!("  [{}/] {} 个条目", ns_name, count));
+                }
+            }
+        }
+        "remember" => {
+            if app.vault_locked { app.push_output("[!] Vault 已锁定，请先 unlock"); return; }
+            if let Some(ref arg_str) = args {
+                let parts: Vec<&str> = arg_str.splitn(3, ' ').collect();
+                match parts.len() {
+                    3 => {
+                        let category = parts[0].trim();
+                        let key = parts[1].trim();
+                        let value = parts[2].trim();
+                        match vault.set("ai_memory", &format!("{}::{}", category, key), value) {
+                            Ok(()) => app.push_output(&format!("[+] AI记忆已存储: [{}/{}] → {}", category, key, value)),
+                            Err(e) => app.push_output(&format!("[!] 存储失败: {}", e)),
+                        }
+                    }
+                    _ => {
+                        app.push_output("[!] 用法: vault remember <分类> <键> <值>");
+                        app.push_output("[*] 例: vault remember target host1 192.168.1.100");
+                        app.push_output("[*] 分类: target/preference/finding/note");
+                    }
+                }
+            } else {
+                app.push_output("[!] 用法: vault remember <分类> <键> <值>");
+            }
+        }
+        "recall" => {
+            if app.vault_locked { app.push_output("[!] Vault 已锁定，请先 unlock"); return; }
+            if let Some(ref arg_str) = args {
+                let key = arg_str.trim();
+                if key.is_empty() {
+                    app.push_output("[!] 用法: vault recall <键>");
+                    return;
+                }
+                let nss = vault.list_namespaces();
+                let mut found = false;
+                for ns_name in &nss {
+                    if let Some(value) = vault.get(ns_name, key) {
+                        app.push_output(&format!("[回忆] [{}] {} = {}", ns_name, key, value));
+                        found = true;
+                    }
+                    // 也尝试 ai_memory 命名空间下的 category::key 格式
+                    if ns_name == "ai_memory" {
+                        let keys = vault.list_keys(ns_name);
+                        for k in &keys {
+                            if k.ends_with(&format!("::{}", key)) {
+                                if let Some(value) = vault.get(ns_name, k) {
+                                    let cat = k.split("::").next().unwrap_or("?");
+                                    app.push_output(&format!("[回忆] [{}/{}] = {}", cat, key, value));
+                                    found = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !found {
+                    app.push_output(&format!("[!] 未找到记忆: {}", key));
+                }
+            } else {
+                app.push_output("[!] 用法: vault recall <键>");
+            }
+        }
         _ => {
-            app.push_output(&format!("[!] 未知子命令: {} — vault status/list/add/set/get/del/passwd", sub));
+            app.push_output(&format!("[!] 未知子命令: {} — vault status/list/add/set/get/del/passwd/ns/remember/recall", sub));
         }
     }
 }
