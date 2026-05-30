@@ -1,26 +1,6 @@
-RUOO-ARSENAL 插件开发完整指南 v9.0
-Zero-Day 编制 — 2025.07
+RUOO-CONSOLE 插件开发完整指南 v10.0
+Zero-Day 编制 — 2026.05.31 (v10.0 )
 
-v9.0 变更 (深度源码审计 — 基于plugin.rs v6.4 + script/plugin_mgr.rs v6.4 + 
-         script/plugin_crash.rs v5.0 + plugin_progress.rs v5.0 + 
-         message_broker.rs v5.2 + plugin_registry.rs + plugin_vault.rs):
-         - 完整反映源码中所有数据结构: PluginHook/SandboxConfig/CircuitBreaker/
-           CrashRecord/InterPluginBus/StringInterner/LoadedPlugin/CommandRegistry
-         - 新增第21节: PluginManager完整实现 (script/plugin_mgr.rs)
-         - 新增第22节: 防崩溃框架深度解析 (PluginCallGuard/CrashReport/CrashType)
-         - 消息代理 v5.2 完整覆盖: 结构化日志/事件广播/插件间通信/速率限制
-         - 熔断器完整参数: max_failures/cooldown/half_open_max/total_failures
-         - FreeLibrary循环卸载机制 (Windows DLL 16次重试)
-         - abandoned_threads join 机制
-         - 插件命令新增字段: is_async/is_long_running/progress_label/min_perm_level
-         - AiToolParam 新增: min_value/max_value/enum_values/default_value
-         - 所有代码示例经过源码验证, 无推测内容
-
-═══════════════════════════════════════════════════════════
-本文档基于 ruoo-arsenal v4.1 插件系统 v9.0 深度审计后编写
-涵盖完整的 C ABI 接口、Rust/C 模板、保险库、进度条、
-消息代理、热重载、熔断器、防崩溃框架及所有高级特性
-═══════════════════════════════════════════════════════════
 
 目录
 ────
@@ -45,8 +25,10 @@ v9.0 变更 (深度源码审计 — 基于plugin.rs v6.4 + script/plugin_mgr.rs 
   19. 调试与故障排查
   20. 附录A: 完整示例插件 (scanner_demo)
   21. 附录B: PluginManager 源码级实现 (script/plugin_mgr.rs)
-  22. 附录C: 防崩溃框架 CrashGuard (PluginCallGuard/CrashReport)
+  22. 附录C: 防崩溃框架 CrashGuard (v4.5 加固) (PluginCallGuard/CrashReport)
   23. 附录D: 插件注册表 PluginRegistry (AES-256-GCM 加密数据库)
+  24. 附录E: 子进程执行宿主 plugin_host.rs (v7.0 进程隔离)
+  25. 附录F: 宿主ABI v2 (HostAPI指针表 + 双模式)
 
 
 ═══════════════════════════════════════════════════════════
@@ -56,7 +38,7 @@ v9.0 变更 (深度源码审计 — 基于plugin.rs v6.4 + script/plugin_mgr.rs 
 插件是动态链接库 (.dll / .so)，通过 C ABI 与主程序通信。
 宿主由 TUI 终端面板 (Rust + ratatui) 驱动, 多线程架构。
 
-宿主进程 (ruoo-arsenal.exe)
+宿主进程 (ruoo-console.exe)
   │
   ├─ 统一命令池 (UnifiedCommandBus)
   │   │
@@ -67,24 +49,41 @@ v9.0 变更 (深度源码审计 — 基于plugin.rs v6.4 + script/plugin_mgr.rs 
   │
   ├─ 用户调用路径: 终端输入命令名 → 统一命令池查找 → plugin_call/内核执行
   │
-  ├─ PluginManager (src/script/plugin_mgr.rs)
-  │   ├─ loaded: HashMap<String, PluginInfo>
-  │   ├─ PluginInfo { lib: Arc<Library>, path, permissions, version,
-  │   │               crash_count, faulted, circuit_breaker,
-  │   │               abandoned_threads: Vec<JoinHandle> }
-  │   ├─ load(name, path)      — 安全加载+调用init+读取元数据
-  │   ├─ reload(name)          — 热重载: 卸载旧版→加载新版→失败回滚
-  │   ├─ force_unload(name)    — 强制卸载: 跳过shutdown→join线程→drop库
-  │   ├─ call(name, cmd)       — 调用exec+30s超时+panic隔离
-  │   ├─ crash_recover(name)   — 崩溃诊断+生成CrashReport+强制卸载
-  │   ├─ health_check(name)    — 多维度: 存活/响应时间/崩溃次数/熔断状态
-  │   └─ probe_plugin(lib)     — 静态分析: 读取permissions+version
+  ├─ PluginManager — 双层架构
+  │   │
+  │   ├─ src/plugin.rs::PluginManager (v6.0 — 加载/调用/保险库)
+  │   │   ├─ plugins: HashMap<String, LoadedPlugin>
+  │   │   ├─ LoadedPlugin { manifest, path, library: Option<Arc<Library>>,
+  │   │   │                 sandbox, circuit_breaker, crashed_count,
+  │   │   │                 abandoned_threads, status, ... }
+  │   │   ├─ load_plugin(name, path) — 完整加载(含vault解密→临时文件→擦除)
+  │   │   ├─ call_plugin(name, cmd)  — 线程隔离+超时+错误检测
+  │   │   ├─ call_plugin_with_timeout(name, cmd, ms) — 带超时调用
+  │   │   └─ cmd_registry: CommandRegistry, inter_plugin_bus, interner
+  │   │
+  │   └─ src/script/plugin_mgr.rs::PluginManager (v7.1 — 子进程调度)
+  │       ├─ loaded: HashMap<String, PluginInfo>
+  │       ├─ PluginInfo { path, permissions, last_modified, version,
+  │       │               crash_count, faulted, circuit_breaker }
+  │       │  
+  │       ├─ load(name, path)      — 临时加载→probe→init→drop lib
+  │       ├─ reload(name)          — 热重载: 卸载旧版→加载新版→失败回滚
+  │       ├─ force_unload(name)    — 强制卸载: skip shutdown→drop
+  │       ├─ crash_recover(name)   — 崩溃诊断+CrashReport+强制卸载
+  │       ├─ health_check(name)    — 多维度健康检查
+  │       └─ probe_plugin(lib)     — 静态分析: permissions+version
+  │
+  ├─ 子进程执行宿主 (src/plugin_host.rs — v7.0 进程隔离)
+  │   ├─ ruoo-console.exe --plugin-exec <dll> <cmd> [--timeout ms]
+  │   ├─ 独立进程加载DLL→exec→输出JSON→退出
+  │   ├─ 任何崩溃仅杀死子进程, 主进程不受影响
+  │   └─ 支持 HostAPI v2 指针表传递 (init接收&HostAPI)
   │
   ├─ 命令注册系统 (src/plugin.rs — CommandRegistry)
-  │   ├─ register_plugin_commands(plugin_name, commands)
-  │   ├─ unregister_plugin_commands(plugin_name)
-  │   ├─ find_command(name) → Option<PluginCommandDef>
-  │   └─ all_plugin_commands() → Vec<PluginCommandDef>
+  │   ├─ register_plugin(plugin_name, cmds) → Result<usize, String>
+  │   ├─ unregister_plugin(plugin_name) → usize
+  │   ├─ find(input) → Option<&PluginCommandDef>
+  │   └─ list_all() → Vec<&PluginCommandDef>
   │
   ├─ AI工具全局注册表 (src/plugin.rs — GLOBAL_AI_TOOLS)
   │   ├─ parking_lot::RwLock<HashMap<String, PluginAiToolDef>>
@@ -95,31 +94,35 @@ v9.0 变更 (深度源码审计 — 基于plugin.rs v6.4 + script/plugin_mgr.rs 
   │   └─ all_ai_tool_json() → Vec<serde_json::Value> (OpenAI格式)
   │
   ├─ 熔断器 (src/plugin.rs — CircuitBreaker)
-  │   ├─ max_failures: u32 (默认10, manifest可配)
-  │   ├─ cooldown_secs: u64 (默认60s)
-  │   ├─ half_open_max: u32 (默认3)
-  │   ├─ 状态机: CLOSED → (failures≥max) → OPEN → (cooldown到期) →
-  │   │          HALF_OPEN → (successes≥half_open_max) → CLOSED
-  │   │                   → (failure) → OPEN
-  │   └─ 方法: record_success/record_failure/can_execute/status
+  │   ├─ threshold: u32 (默认10, manifest.crash_threshold可配)
+  │   ├─ cooldown_secs: u64 (默认120s)
+  │   ├─ window_secs: u64 (默认60s, 失败计数窗口)
+  │   ├─ crash_history: Vec<CrashRecord> (最近64条崩溃记录)
+  │   ├─ 状态机: CLOSED → (failure_count≥threshold) → OPEN →
+  │   │          (cooldown到期) → HALF_OPEN → (一次成功) → CLOSED
+  │   │          HALF_OPEN + failure → OPEN
+  │   │          
+  │   └─ 方法: record_success/record_failure/allow_call/status_report
   │
   ├─ 插件间通信总线 (src/plugin.rs — InterPluginBus)
   │   ├─ 消息路由: from_plugin → to_plugin (空=广播)
-  │   ├─ 主题订阅: HashMap<topic, Vec<plugin_name>>
-  │   ├─ 消息队列: VecDeque<InterPluginMessage>
-  │   └─ 方法: send/broadcast/subscribe/unsubscribe/poll/drain
+  │   ├─ 主题订阅: HashMap<plugin_name, Vec<topic>>
+  │   ├─ 消息队列: Vec<InterPluginMessage> (max 1024)
+  │   └─ 方法: publish/subscribe/unsubscribe/drain_for
   │
-  ├─ 事件钩子 (src/plugin.rs — PluginHook)
-  │   ├─ 事件类型: OnLoad/OnUnload/OnCommand/OnError/OnCrash
-  │   │            OnProgress/OnMessage/OnConfigChange/OnTimer
-  │   │            OnInterPluginMsg/OnSandboxViolation
-  │   └─ 注册: manifest.hooks 字段声明
+  ├─ 事件钩子 (src/plugin.rs — PluginHook/HookEvent)
+  │   ├─ 事件类型: OnLoad/OnUnload/OnCmd(String)/OnScanComplete/OnTimer
+  │   │            OnHotReload/OnCrash(String)/OnCircuitOpen(String)/
+  │   │            OnCircuitClose(String)/OnConfigChange/OnHostShutdown/
+  │   │            OnPluginMessage{from,msg}
+  │   └─ 注册: manifest.hooks 字段声明 {event, command, interval_secs}
   │
   ├─ 沙箱配置 (src/plugin.rs — SandboxConfig)
-  │   ├─ 网络: allowed_ports/blocked_ports/allowed_hosts/blocked_hosts
-  │   ├─ 文件: allowed_paths/blocked_paths/max_file_size
-  │   ├─ 进程: allow_exec/max_child_processes/exec_timeout_ms
-  │   └─ 内存: max_memory_mb/max_stack_mb
+  │   ├─ 粗粒度布尔开关模型 (非精细端口/路径白名单)
+  │   ├─ timeout_ms: u64 (默认30s)
+  │   ├─ network_enabled / filesystem_enabled / exec_enabled
+  │   ├─ plugin_call_enabled / hot_reload_enabled
+  │   └─ max_memory_mb / max_output_bytes
   │
   ├─ 字符串驻留器 (src/plugin.rs — StringInterner)
   │   └─ 优化: 插件间共享常用字符串引用, 减少堆分配
@@ -134,9 +137,9 @@ v9.0 变更 (深度源码审计 — 基于plugin.rs v6.4 + script/plugin_mgr.rs 
   │   ├─ 7-pass 安全擦除 (覆写+随机+归零)
   │   └─ 方法: store/load/delete/list/shred
   │
-  ├─ MultiProgressManager (src/plugin_progress.rs)
+  ├─ MultiProgressManager (src/plugin_progress.rs v5.1)
   │   ├─ C ABI: ruoo_progress_create/update/finish/set_total
-  │   ├─ 自动清理: 300s超时(活跃)/30s(已完成)
+  │   ├─ 自动清理: 300s超时(活跃)/3s(已完成)
   │   └─ 渲染: render_line [████░░] 20字符宽 / render_compact
   │
   ├─ MessageBroker (src/message_broker.rs)
@@ -148,15 +151,24 @@ v9.0 变更 (深度源码审计 — 基于plugin.rs v6.4 + script/plugin_mgr.rs 
   │   ├─ 崩溃通知: CrashNotify 自动触发 crash_recover
   │   └─ 事件广播: EventBroadcast → 所有订阅者
   │
+  ├─ 宿主ABI v2 (src/host_abi.rs v4.1)
+  │   ├─ HostAPI 函数指针表 — 传递给 ruoo_plugin_init
+  │   ├─ progress_create/update/finish/set_total
+  │   ├─ message_push/tagged/update/remove
+  │   ├─ vault_store/load/delete/list
+  │   ├─ interplugin_send/broadcast
+  │   └─ 双模式: 主进程(操作真实状态) / 子进程(写stderr转发)
+  │
   └─ 插件 .dll/.so (C ABI 动态链接库)
-      ├─ ★ ruoo_plugin_init()           — 必须: 初始化
-      ├─ ★ ruoo_plugin_exec(cmd)        — 必须: 执行命令
-      ├─ ★ ruoo_plugin_free_result(ptr) — 必须: 释放内存
-      ├─ ☆ ruoo_plugin_shutdown()       — 可选: 清理
-      ├─ ☆ ruoo_plugin_version()        — 可选: 版本号
-      ├─ ☆ ruoo_plugin_permissions()    — 可选: 权限位掩码
-      ├─ ☆ ruoo_plugin_commands()       — 可选: 命令JSON (强烈建议!)
-      ├─ ☆ ruoo_plugin_manifest()       — 可选: 完整元数据JSON
+      ├─ ★ ruoo_plugin_init()                  — 必须: 初始化
+      ├─ ★ ruoo_plugin_init(*const HostAPI)    — v2: 接收指针表
+      ├─ ★ ruoo_plugin_exec(cmd)               — 必须: 执行命令
+      ├─ ★ ruoo_plugin_free_result(ptr)        — 必须: 释放内存
+      ├─ ☆ ruoo_plugin_shutdown()              — 可选: 清理
+      ├─ ☆ ruoo_plugin_version()               — 可选: 版本号
+      ├─ ☆ ruoo_plugin_permissions()           — 可选: 权限位掩码
+      ├─ ☆ ruoo_plugin_commands()              — 可选: 命令JSON (强烈建议!)
+      ├─ ☆ ruoo_plugin_manifest()              — 可选: 完整元数据JSON
       └─ ☆ 调用宿主 C ABI:
             ruoo_progress_create/update/finish/set_total
             ruoo_message_push/update/tagged/remove
@@ -489,15 +501,29 @@ PluginManifest 结构 (18字段):
   "crash_threshold":     10                        // v6.0: 熔断器阈值(0=使用默认10)
 }
 
-PluginHook 结构:
+PluginHook 结构 (src/plugin.rs):
 {
-  "event":    "OnLoad|OnUnload|OnCommand|OnError|OnCrash|
-               OnProgress|OnMessage|OnConfigChange|OnTimer|
-               OnInterPluginMsg|OnSandboxViolation",
-  "handler":  "命令名 (触发时调用的命令)",
-  "priority": 0,                                   // 优先级 (数字越小越先执行)
-  "async":    false                                // 是否异步执行
+  "event":         "事件名",         // 见下方 HookEvent 枚举
+  "command":       "命令名",         // 触发时调用的命令
+  "interval_secs": 0                 // 定时器间隔 (仅 OnTimer)
 }
+
+HookEvent 枚举 (代码中实际事件类型):
+  OnLoad              — 插件加载完成
+  OnUnload            — 插件卸载前
+  OnCmd(String)       — 任意命令执行前 (含命令名)
+  OnScanComplete      — 扫描完成
+  OnTimer             — 定时触发 (配合 interval_secs)
+  OnHotReload         — 热重载触发
+  OnCrash(String)     — 插件崩溃 (含错误信息)
+  OnCircuitOpen(String) — 熔断器打开
+  OnCircuitClose(String) — 熔断器关闭
+  OnConfigChange      — 配置变更
+  OnHostShutdown      — 宿主关闭
+  OnPluginMessage { from: String, msg: String } — 插件间消息
+
+  ⚠ v10.0 修正: 不存在 OnCommand/OnError/OnProgress/OnMessage/
+     OnInterPluginMsg/OnSandboxViolation 事件
 
 Manifest 示例 (scanner_demo):
 {
@@ -511,8 +537,8 @@ Manifest 示例 (scanner_demo):
   "signature": null,
   "commands": [],
   "hooks": [
-    {"event":"OnLoad","handler":"plugin_status","priority":0,"async":false},
-    {"event":"OnCrash","handler":"plugin_status","priority":0,"async":true}
+    {"event":"OnLoad","command":"plugin_status","interval_secs":0},
+    {"event":"OnCrash","command":"plugin_status","interval_secs":0}
   ],
   "timeout_ms": 60000,
   "config": {"default_ports":"1-1000","max_concurrency":"500"},
@@ -1103,50 +1129,59 @@ C ABI 接口:
 ═══════════════════════════════════════════════════════════
 
 InterPluginBus 允许已加载的插件互相发送消息, 无需通过宿主中转。
+位于 src/plugin.rs。
 
 消息结构:
   InterPluginMessage {
-      from:    String,     // 发送方插件名
-      to:      String,     // 接收方插件名 (空=广播所有)
-      msg_type:String,     // 消息类型 (自定义, 如 "scan_result"/"alert")
-      payload: String,     // JSON 载荷
-      timestamp: Instant,
-      id:       u64,       // 原子递增消息ID
+      from_plugin:     String,    // 发送方插件名
+      to_plugin:       String,    // 接收方插件名 (空=广播)
+      msg_type:        String,    // 消息类型 ("event"/"request"/"response"/"data")
+      payload:         String,    // JSON 载荷
+      timestamp:       Instant,
+      correlation_id:  String,    // 请求-响应关联ID
   }
 
 路由规则:
-  - to 为空或 "all" → 广播到所有插件 (除发送者)
-  - to 为具体插件名 → 点对点 (若目标未加载, 消息进dead letter队列)
-  - to 为 "subscribers:<topic>" → 主题订阅者
+  - to_plugin 为空 → 广播到所有订阅者 (按topic过滤)
+  - to_plugin 为具体插件名 → 点对点 (仅目标插件 drain_for 时取出)
 
 主题订阅:
-  subscribe(plugin_name, topic)
-  unsubscribe(plugin_name, topic)
-  get_subscribers(topic) → Vec<plugin_name>
+  订阅结构: HashMap<plugin_name, Vec<topic>>
+  subscribe(plugin, topic)
+  unsubscribe(plugin, topic)
 
 方法 (宿主侧):
-  send(from, to, msg_type, payload) → 点对点发送
-  broadcast(from, msg_type, payload) → 广播所有
-  poll(plugin_name) → Vec<InterPluginMessage> (取出该插件待处理消息)
-  drain() → 取出所有待处理消息
+  publish(msg: InterPluginMessage) — 发布消息到队列 (最多1024条)
+  drain_for(plugin_name: &str) → Vec<InterPluginMessage>
+    — 取出该插件待处理消息 (按订阅过滤+定向匹配, 使用retain原地移除)
+  subscribe(plugin: &str, topic: &str)
+  unsubscribe(plugin: &str, topic: &str)
 
-C ABI 接口 (插件侧):
-  ruoo_interplugin_send(to: *const c_char, msg_type: *const c_char,
-                        payload: *const c_char) -> i32
-  ruoo_interplugin_broadcast(msg_type: *const c_char,
-                             payload: *const c_char) -> i32
-  ruoo_interplugin_poll() -> *mut c_char
-    返回: JSON数组 [{from, msg_type, payload, id}] (调用者free)
+  ⚠ v10.0 修正: 方法名为 publish/drain_for/subscribe/unsubscribe,
+    不存在 send/broadcast/poll/drain。
+
+C ABI 接口 (host_abi.rs):
+  ruoo_interplugin_send(from, to, msg_type, payload) -> i32
+  ruoo_interplugin_broadcast(from, msg_type, payload) -> i32
+  (转发到 MessageBroker 的 InterPlugin 消息)
 
 使用示例 (插件A 发送扫描结果给 插件B):
-  // 插件A
-  ruoo_interplugin_send("reporter", "scan_complete",
-      "{\"target\":\"192.168.1.1\",\"open_ports\":[22,80,443]}");
+  // 插件A 发布
+  let msg = InterPluginMessage {
+      from_plugin: "scanner".into(),
+      to_plugin: "reporter".into(),
+      msg_type: "scan_complete".into(),
+      payload: json!({"target":"192.168.1.1","open_ports":[22,80,443]}).to_string(),
+      timestamp: Instant::now(),
+      correlation_id: uuid::Uuid::new_v4().to_string(),
+  };
+  inter_plugin_bus.publish(msg);
 
   // 插件B (reporter) 轮询
-  char* msgs = ruoo_interplugin_poll();
-  // 解析 JSON 数组, 处理每条消息
-  free(msgs);
+  let msgs = inter_plugin_bus.drain_for("reporter");
+  for msg in msgs {
+      // 处理每条消息
+  }
 
 
 ═══════════════════════════════════════════════════════════
@@ -1200,56 +1235,79 @@ C ABI 接口 (插件侧):
 ═══════════════════════════════════════════════════════════
 
 CircuitBreaker 防止故障插件反复崩溃导致终端不可用。
+位于 src/plugin.rs。
 
 结构:
   CircuitBreaker {
-      state:          CircuitState,  // CLOSED/OPEN/HALF_OPEN
-      max_failures:   u32,           // 默认10 (manifest.crash_threshold可配)
-      cooldown_secs:  u64,           // 默认60s
-      half_open_max:  u32,           // 默认3 (HALF_OPEN状态最多允许3次试探)
-      failure_count:  u32,           // 当前窗口失败次数
-      success_count:  u32,           // HALF_OPEN状态成功次数
-      last_failure:   Option<Instant>,
-      last_state_change: Instant,
-      total_failures: u64,           // 历史总失败数
-      total_successes: u64,          // 历史总成功数
+      failure_count:     u32,                  // 当前窗口失败次数
+      last_failure_time: Option<Instant>,       // 最近失败时间
+      threshold:         u32,                  // 失败阈值 (默认10, manifest.crash_threshold可配)
+      window_secs:       u64,                  // 失败计数窗口 (默认60s)
+      cooldown_secs:     u64,                  // 熔断冷却时间 (默认120s)
+      state:             CircuitState,         // CLOSED/OPEN/HALF_OPEN/Disabled
+      total_crashes:     u32,                  // 历史总崩溃数
+      crash_history:     Vec<CrashRecord>,     // 最近64条崩溃记录
+  }
+
+  CircuitState 枚举:
+      Closed      — 正常, 允许调用
+      HalfOpen    — 半开, 试探性恢复 (一次成功即回Closed)
+      Open        — 熔断, 拒绝调用
+      Disabled    — 永久禁用
+
+  CrashRecord {
+      timestamp:      Instant,
+      error_msg:      String,
+      stack_snapshot: Option<String>,
+      call_command:   String,
   }
 
 状态机:
   CLOSED (正常)
-    → record_failure() → failure_count++
-    → failure_count >= max_failures → OPEN
-    → record_success() → failure_count = 0
+    → record_failure(error_msg, command) → failure_count++
+    → failure_count >= threshold → state = Open
+    → record_success() → 若HalfOpen则回Closed
 
   OPEN (熔断)
-    → can_execute() → false (拒绝执行)
-    → cooldown_secs 到期 → HALF_OPEN
-    → 输出: "[!] 插件 xxx 熔断已触发: 10次失败/60秒"
+    → allow_call() → false (拒绝执行)
+    → cooldown_secs 到期 → 自动转为 HalfOpen (allow_call()内部)
+    → 输出: "CircuitBreaker[Open] failures=N/10 total_crashes=N cooldown=120s"
 
   HALF_OPEN (试探)
-    → can_execute() → true (最多half_open_max次)
-    → record_success() → success_count++
-    → success_count >= half_open_max → CLOSED (恢复正常)
-    → record_failure() → 立即回到 OPEN
+    → allow_call() → true
+    → record_success() → 立即回到 CLOSED (⚠ 无half_open_max, 一次成功即恢复)
+    → record_failure() → 回到 OPEN
 
 方法:
-  new(max_failures: u32) → Self
-  record_success(&mut self) → 记录成功
-  record_failure(&mut self) → 记录失败, 可能触发熔断
-  can_execute(&self) → bool → 当前是否允许执行
-  status(&self) → CircuitStatus { state, failure_count, cooldown_remaining }
+  new(threshold: u32) → Self
+    若 threshold==0 则使用默认值10
+
+  record_success(&mut self)
+    HalfOpen状态 → 立即恢复Closed + failure_count清零
+
+  record_failure(&mut self, error_msg: &str, command: &str) → bool
+    记录崩溃到crash_history (drain截断保留64条)
+    窗口内失败+1, 达到threshold → 触发OPEN
+    返回true=已触发熔断
+
+  allow_call(&mut self) → bool  (⚠ 可变借用, 内含状态转换)
+    Open + cooldown到期 → 自动转HalfOpen + failure_count清零
+
+  disable(&mut self) → 永久禁用
+  reset(&mut self) → 强制重置到Closed
+  status_report(&self) → String
 
 使用示例:
   let cb = CircuitBreaker::new(10);
-  // 默认: max_failures=10, cooldown=60s, half_open_max=3
+  // 默认: threshold=10, window=60s, cooldown=120s
 
-  if cb.can_execute() {
+  if cb.allow_call() {
       match plugin_call(...) {
-          Ok(result) => cb.record_success(),
-          Err(_) => cb.record_failure(),
+          Ok(_) => cb.record_success(),
+          Err(e) => { cb.record_failure(&e, "scan"); }
       }
   } else {
-      println!("熔断中, 剩余冷却: {}s", cb.status().cooldown_remaining);
+      println!("熔断中: {}", cb.status_report());
   }
 
 
@@ -1259,42 +1317,29 @@ CircuitBreaker 防止故障插件反复崩溃导致终端不可用。
 
 双层权限体系:
   1. 插件自我声明权限 (ruoo_plugin_permissions → u32 位掩码)
-  2. 宿主强制执行 SandboxConfig (manifest.config 或宿主策略)
+  2. 宿主强制执行 SandboxConfig (粗粒度布尔开关)
 
-SandboxConfig 结构:
+SandboxConfig 结构 (src/plugin.rs):
   SandboxConfig {
-      // 网络限制
-      allowed_ports:     Vec<u16>,     // 允许的端口 (空=全部允许)
-      blocked_ports:     Vec<u16>,     // 阻止的端口
-      allowed_hosts:     Vec<String>,  // 允许的主机 (支持CIDR)
-      blocked_hosts:     Vec<String>,  // 阻止的主机
-      allow_raw_socket:  bool,         // 原始套接字 (默认false)
-      // 文件系统限制
-      allowed_paths:     Vec<String>,  // 允许的路径前缀
-      blocked_paths:     Vec<String>,  // 阻止的路径前缀
-      max_file_size:     u64,          // 最大文件大小 (0=无限)
-      allow_write:       bool,         // 写权限
-      allow_delete:      bool,         // 删除权限
-      // 进程限制
-      allow_exec:        bool,         // 进程执行权限
-      max_child_processes: u32,        // 最大子进程数 (0=禁止)
-      exec_timeout_ms:   u64,          // 子进程超时
-      // 内存限制
-      max_memory_mb:     u64,          // 最大内存占用 (0=无限)
-      max_stack_mb:      u64,          // 最大栈大小
+      timeout_ms:          u64,    // 调用超时 (默认30_000)
+      max_output_bytes:    usize,  // 最大输出字节 (默认10MB)
+      max_memory_mb:       u64,    // 最大内存占用 (默认512MB)
+      network_enabled:     bool,   // 网络访问 (默认true)
+      filesystem_enabled:  bool,   // 文件系统访问 (默认false)
+      exec_enabled:        bool,   // 子进程执行 (默认false)
+      plugin_call_enabled: bool,   // 插件间调用 (默认false)
+      hot_reload_enabled:  bool,   // 热重载 (默认true)
   }
 
-权限检查流程:
-  1. 插件声明 permissions (如 0x07 = NET+FS+EXEC)
-  2. 宿主加载时检查 SandboxConfig
-  3. 插件权限 & SandboxConfig限制 → 实际可用权限
-  4. 违反限制 → OnSandboxViolation 钩子触发
+  ⚠ v10.0 重要修正: SandboxConfig 是粗粒度布尔开关模型, 不存在
+  allowed_ports/blocked_hosts/allowed_paths 等精细白名单。
+  细粒度沙箱需要插件自行在 exec() 中实现。
 
 默认 SandboxConfig:
-  - NET: 仅允许 80/443/22/8080 端口
-  - FS: 仅允许读写当前工作目录
-  - EXEC: 禁止
-  - MEM: 512MB 上限
+  - 网络: 启用
+  - 文件系统: 禁用
+  - 子进程: 禁用
+  - 内存: 512MB
 
 插件声明的权限仅作为建议, 宿主有最终决定权。
 
@@ -1323,7 +1368,7 @@ SandboxConfig 结构:
 
 从插件内调用内核模块:
   插件需 KERNEL 权限 + 宿主允许
-  通过 InterPluginBus 发送 "kernel:load" 消息给内置内核管理插件
+  通过 InterPluginBus.publish 发送 "kernel:load" 消息给内置内核管理插件
 
 
 ═══════════════════════════════════════════════════════════
@@ -1383,59 +1428,59 @@ C 编译:
 
 加载流程 (plugin load <name> <path>):
 
+  ⚠ v7.1 子进程架构: 加载时临时加载DLL用于probe+init, 之后立即drop。
+  实际exec通过独立子进程 (plugin_host.rs) 完成。
+
   1. 验证: 检查名称是否已加载
   2. 解析路径: canonicalize → 绝对路径
   3. 获取 mtime: 用于后续热重载检测
-  4. 加载库: unsafe { Library::new(path) }
+  4. 加载库: unsafe { Library::new(path) } (临时)
   5. 读取元数据: probe_plugin()
      - ruoo_plugin_permissions → 权限位掩码
      - ruoo_plugin_version → 版本字符串
   6. 调用 init: ruoo_plugin_init() → 检查返回码(必须为0)
-  7. 获取命令: ruoo_plugin_commands() → 解析JSON
-  8. 注册命令: CommandRegistry.register_plugin_commands()
-  9. 注册AI工具: register_ai_tools() → GLOBAL_AI_TOOLS
-  10. 创建 PluginInfo: lib(Arc), path, version, permissions,
-      crash_count=0, faulted=false, circuit_breaker(default),
-      abandoned_threads=[]
-  11. 插入 Hashmap: loaded.insert(name, PluginInfo)
-  12. 输出: "[+] 插件已加载: name v1.0.0 | 命令: N个 | AI工具: M个"
+  7. ⚠ drop(lib) — v7.1: init后丢弃DLL, 执行通过子进程隔离
+  8. 创建 PluginInfo (无 lib 字段): path, version, permissions,
+     crash_count=0, faulted=false, circuit_breaker(default)
+  9. 插入 Hashmap: loaded.insert(name, PluginInfo)
+  10. 输出: "[+] 插件已加载: name v1.0.0 | 路径: ..."
+
+  注: 命令注册和AI工具注册由上层 (plugin.rs::PluginManager) 完成
 
 调用流程 (plugin call <name> <cmd> 或 AI tool invocation):
 
-  1. 查找: loaded.get(name) → 检查存在 + 未faulted
-  2. 熔断器检查: circuit_breaker.can_execute()
-  3. 创建 PluginCallGuard: 记录 name/version/path/cmd/crash_count
-  4. 获取 exec 函数指针: lib.get::<fn>(b"ruoo_plugin_exec")
-  5. 独立线程执行: std::thread::spawn + catch_unwind
-  6. mpsc channel + recv_timeout(30s):
-     a. 正常: 收到结果 → record_success
-     b. 超时: 线程 abandoned → 记录 CrashReport(Timeout)
-        abandoned_threads.push(handle)
-        record_failure → 可能触发熔断
-     c. Panic: catch_unwind 捕获 → 记录 CrashReport(Panic)
-        record_failure → 可能触发熔断
-  7. 调用 free_result: 释放返回的 CString
-  8. 返回结果到终端
+  v7.1 子进程模式 (plugin_host.rs):
+  1. 查找: loaded.get(name) → 检查存在 + !faulted
+  2. 熔断器检查: circuit_breaker.allow_call()
+  3. 启动子进程: ruoo-console.exe --plugin-exec <dll> <cmd>
+  4. 子进程: 加载DLL → init(HostAPI指针表) → exec → 输出JSON到stdout → 退出
+  5. 父进程: 读取stdout JSON → 解析 PluginHostResult
+  6. 任何崩溃仅杀死子进程, 主进程不受影响
+  7. 超时: 父进程侧 kill 子进程
+  8. 正常: record_success / 失败: record_failure → 可能触发熔断
+
+  v6.0 进程内模式 (plugin.rs::PluginManager, 保留兼容):
+  1. 查找 + 熔断器检查
+  2. 获取 exec 函数指针: lib.get::<fn>(b"ruoo_plugin_exec")
+  3. 独立线程执行: std::thread::spawn + catch_unwind
+  4. mpsc channel + recv_timeout(30s)
+  5. 超时: 线程abandoned → abandoned_threads.push(handle)
+  6. 调用 free_result 释放内存
 
 卸载流程 (plugin unload <name>):
 
   1. 查找 + 移除: loaded.remove(name)
-  2. join abandoned_threads: 等待所有超时线程退出
-  3. 调用 shutdown: ruoo_plugin_shutdown()
-  4. 注销命令: CommandRegistry.unregister_plugin_commands()
-  5. 注销AI工具: unregister_ai_tools()
-  6. 清除进度条: MultiProgressManager.clear_plugin()
-  7. [Windows] FreeLibrary 循环: 16次重试
-  8. drop lib: Arc<Library> 引用计数归零
-  9. 输出: "[-] 插件已卸载: name"
+  2. v6.0: join abandoned_threads + 调用 shutdown + FreeLibrary
+  3. v7.1: 直接drop — 无进程内资源需清理
+  4. 注销命令 + 注销AI工具 + 清除进度条
+  5. 输出: "[-] 插件已卸载: name"
 
 强制卸载 (plugin force_unload <name>):
 
   1. 跳过 shutdown 调用
-  2. 跳过正常清理流程
-  3. 直接 join threads + drop lib + FreeLibrary
-  4. 适用于: 崩溃插件 / shutdown 卡死的插件
-  5. 副作用: 插件资源泄漏 (文件句柄/网络连接), 但终端不崩溃
+  2. 直接 drop + 清理
+  3. 适用于: 崩溃插件 / shutdown 卡死的插件
+  4. 副作用: 插件资源可能泄漏, 但终端不崩溃
 
 
 ═══════════════════════════════════════════════════════════
@@ -1538,129 +1583,132 @@ Cargo.toml:
 
 
 ═══════════════════════════════════════════════════════════
-21. 附录B: PluginManager 源码级实现
+21. 附录B: PluginManager 源码级实现 (双层架构)
 ═══════════════════════════════════════════════════════════
 
-PluginManager 位于 src/script/plugin_mgr.rs, 是插件系统的执行核心。
+⚠ v10.0 重大修正: 存在两个 PluginManager, 分工不同。
+
+A. src/script/plugin_mgr.rs::PluginManager (v7.1 — 子进程调度)
+─────────────────────────────────────────────────────────────
 
 核心数据结构:
 
   PluginInfo {
-      lib:              Arc<libloading::Library>,  // 共享库 (Arc支持多线程)
-      path:             PathBuf,                    // 原始文件路径
-      permissions:      PluginPermissions,          // 权限位掩码
-      last_modified:    SystemTime,                 // mtime (热重载检测用)
-      version:          String,                     // 来自 ruoo_plugin_version
-      crash_count:      u32,                        // 累计崩溃次数
-      faulted:          bool,                       // 连续崩溃>=3标记故障
-      circuit_breaker:  CircuitBreaker,             // 熔断器实例
-      abandoned_threads: Vec<JoinHandle<()>>,       // 超时线程句柄
+      // ⚠ v7.1: 无 lib 字段 — 子进程架构, init后drop库
+      path:             PathBuf,             // 原始文件路径
+      permissions:      PluginPermissions,   // 权限位掩码
+      last_modified:    SystemTime,          // mtime (热重载检测用)
+      version:          String,              // 来自 ruoo_plugin_version
+      crash_count:      u32,                 // 累计崩溃次数
+      faulted:          bool,                // 连续崩溃>=3标记故障
+      circuit_breaker:  CircuitBreaker,      // 熔断器实例
   }
 
-关键方法详解:
+方法:
 
   load(name, path) → Result<String, String>
   ─────────────────────────────────────────
-  1. 检查 name 是否已加载 → 返回错误
-  2. PathBuf::from(path) → canonicalize → 绝对路径
-  3. metadata().modified() → 记录 mtime
-  4. unsafe { Library::new(&canonical) } → 加载 DLL/SO
-  5. probe_plugin(&lib, &canonical):
-     - lib.get::<fn()->u32>(b"ruoo_plugin_permissions") → u32 (未导出=0)
-     - lib.get::<fn()->*const c_char>(b"ruoo_plugin_version") → 版本 (未导出="0.0.0")
-  6. lib.get::<fn()->i32>(b"ruoo_plugin_init") → 获取init指针
-     - 若未导出: 返回 "插件缺少 ruoo_plugin_init 导出" 错误
-     - 调用 init() → 检查返回码 != 0 → 错误
-  7. 创建 PluginInfo + 插入 HashMap
-  8. 返回成功消息
+  1. 检查 name 是否已加载
+  2. canonicalize → 绝对路径 → 获取 mtime
+  3. unsafe { Library::new(&canonical) } (临时)
+  4. probe_plugin → permissions + version
+  5. lib.get(b"ruoo_plugin_init") → 调用 init() → 检查返回码
+  6. drop(lib) — v7.1: init后立即丢弃
+  7. 创建 PluginInfo + 插入 loaded HashMap
 
   probe_plugin(lib, path) → Result<(PluginPermissions, String), String>
   ──────────────────────────────────────────────────────────────────
-  纯静态分析, 不执行插件代码 (只读取函数指针).
-  用于: 首次加载前的元数据收集, 命令行 plugin info <path>
+  纯静态分析: ruoo_plugin_permissions() → u32, ruoo_plugin_version() → String
 
-  reload(name) → Result<String, String>
-  ─────────────────────────────────────
-  1. hotload_inner(name, &path):
-     a. loaded.remove(name) → 取出旧 PluginInfo
-     b. join abandoned_threads
-     c. 调用 ruoo_plugin_shutdown()
-     d. drop lib
-     e. [Windows] 16次 FreeLibrary 循环
-     f. 重新 Library::new → probe_plugin → init
-  2. 如果加载新版失败:
-     a. 重新加载旧版 (原路径)
-     b. 恢复 crash_count
-     c. 如果回滚也失败 → 插件永久卸载
+  reload(name) → 热重载
+  ─────────────────────
+  1. hotload_inner: remove旧版 → 临时加载新版 → probe → init → drop lib
+  2. 失败自动回滚: 重新加载旧版, 恢复 crash_count
+  3. 回滚也失败 → 插件永久卸载
 
-  force_unload(name) → Result<String, String>
-  ───────────────────────────────────────────
-  1. loaded.remove(name) → 取出 PluginInfo
-  2. join abandoned_threads (不调用 shutdown!)
-  3. drop lib (强制卸载库)
-  4. [Windows] FreeLibrary 循环
-  5. 注明: 插件资源可能泄漏, 但终端不受影响
+  force_unload(name) — 强制卸载, 跳过shutdown, 直接drop
 
-  call(name, cmd) → Result<String, String>
-  ────────────────────────────────────────
-  1. loaded.get(name) → 检查存在 + !faulted
-  2. circuit_breaker.can_execute() → 熔断检查
-  3. 获取 exec 函数指针
-  4. PluginCallGuard::new(...)
-  5. call_with_timeout(f, 30000):
-     - std::thread::spawn + catch_unwind
-     - mpsc::channel + recv_timeout(30s)
-     - 正常: 返回结果 + record_success
-     - 超时: 记录Timeout崩溃 + record_failure
-     - Panic: 记录Panic崩溃 + record_failure
-  6. free_result(ptr) → 释放内存
-  7. 如果崩溃: crash_count++ + circuit_breaker.record_failure()
-     如果 crash_count >= 3 → faulted = true
-     如果 circuit_breaker 状态=OPEN → 输出熔断警告
+  crash_recover(name) — 崩溃诊断+CrashReport+强制卸载 (委托 plugin_crash.rs)
 
-  crash_recover(name) → Result<CrashReport, String>
-  ─────────────────────────────────────────────────
-  1. 获取插件信息
-  2. 生成 CrashReport: 时间/类型/堆栈/建议
-  3. persist_crash_log(&report) → 持久化到文件
-  4. force_unload(name) → 强制清理
-  5. 返回 CrashReport (供UI展示)
+  health_check(name) — 多维度: 存活/崩溃次数/熔断状态
 
-  health_check(name) → PluginHealth
-  ──────────────────────────────────
-  返回: HEALTHY / DEGRADED / FAULTED
-  指标: alive(可调用exec) | response_time_ms | crash_count |
-        circuit_breaker_status | abandoned_threads_count |
-        memory_estimate
+  get_info(name) → Option<&PluginInfo> — 供AI全局管理器查询
 
-Windows DLL 卸载细节:
-  #[cfg(windows)]
-  {
-      extern "system" {
-          fn GetModuleHandleW(lpModuleName: *const u16) -> isize;
-          fn FreeLibrary(hLibModule: isize) -> i32;
-      }
-      // 获取 DLL 的宽字符串路径
-      let wide: Vec<u16> = OsStr::new(&old_path).encode_wide()
-          .chain(std::iter::once(0)).collect();
-      // 最多尝试16次 FreeLibrary
-      for _ in 0..16 {
-          let h = GetModuleHandleW(wide.as_ptr());
-          if h == 0 { break; }  // DLL 已卸载
-          FreeLibrary(h);
-          std::thread::sleep(Duration::from_millis(10));
-      }
+
+B. src/plugin.rs::PluginManager (v6.0 — 加载/调用/保险库)
+─────────────────────────────────────────────────────────
+
+核心数据结构:
+
+  PluginManager {
+      plugins:          HashMap<String, LoadedPlugin>,
+      load_order:       Vec<String>,
+      cmd_registry:     CommandRegistry,
+      plugin_dirs:      Vec<String>,
+      inter_plugin_bus: Arc<InterPluginBus>,
+      interner:         StringInterner,
+      total_calls:      AtomicU64,
+      total_crashes:    AtomicU64,
+      plugin_vault:     Option<Arc<PluginVault>>,   // v7.0
   }
 
+  LoadedPlugin {
+      manifest:          PluginManifest,
+      path:              String,
+      library:           Option<Arc<libloading::Library>>,  // 进程内模式
+      loaded_at:         Instant,
+      call_count:        u64,
+      total_call_time_ms: u64,
+      sandbox:           SandboxConfig,
+      verified:          bool,
+      status:            PluginStatus,
+      circuit_breaker:   CircuitBreaker,
+      last_call_command: String,
+      crashed_count:     u32,
+      abandoned_threads: Vec<JoinHandle<()>>,
+  }
+
+  PluginStatus: Active/Sandboxed/Timeout/Error/Unloaded/
+                CircuitOpen/Degraded/Faulted
+
+关键方法:
+
+  load_plugin(name, path) → Result<String, String>
+  ────────────────────────────────────────────────
+  v7.0: 优先检查保险库 → 解密到临时文件 → 加载 → 擦除临时文件
+  1. 解析路径 (vault优先)
+  2. Library::new + load_manifest + 验证签名 + 检查依赖
+  3. init() + 注册命令到 CommandRegistry + 注册AI工具
+  4. 创建 LoadedPlugin (含 Arc<Library>)
+  5. 清理临时解密文件
+
+  call_plugin(name, cmd) → Result<String, String>
+  call_plugin_with_timeout(name, cmd, timeout_ms) → Result<String, String>
+  ────────────────────────────────────────────────────────────────
+  1. 检查 faulted 状态 + circuit_breaker.allow_call()
+  2. 提取 Arc<Library> → 独立线程 + catch_unwind
+  3. mpsc channel + recv_timeout → 超时则 abandoned_threads.push
+  4. free_result 释放内存
+  5. 更新统计: call_count, total_call_time_ms
+
 
 ═══════════════════════════════════════════════════════════
-22. 附录C: 防崩溃框架 CrashGuard
+22. 附录C: 防崩溃框架 CrashGuard (v6.0)
 ═══════════════════════════════════════════════════════════
 
-防崩溃框架位于 src/script/plugin_crash.rs, 三层隔离设计:
-  Layer 1: catch_unwind — Rust panic 不传播
-  Layer 2: mpsc + recv_timeout — 线程超时检测
-  Layer 3: force_unload — 库强制卸载 + Windows FreeLibrary 循环
+防崩溃框架位于 src/script/plugin_crash.rs + src/panic_guard.rs, 四级隔离设计:
+  Layer 1: native_crash::enter_protected_call — SEH (VEH+setjmp/longjmp)
+           捕获 ACCESS_VIOLATION/ILLEGAL_INSTRUCTION 等硬件异常
+  Layer 2: catch_unwind — Rust panic 不传播到主线程
+  Layer 3: 独立线程 — 崩溃不传播到主线程
+  Layer 4: 熔断器 — 连续崩溃自动禁用
+
+v6.0 变更 (Zero-Day):
+  四级隔离: native_crash::enter_protected_call (SEH+VEH+longjmp)
+            → catch_unwind (Rust panic)
+            → 独立线程边界
+            → 熔断器
+  ACCESS_VIOLATION 等硬件异常不再穿透到进程级别
 
 CrashType 枚举:
   Panic          — Rust panic (被 catch_unwind 捕获)
@@ -1742,17 +1790,25 @@ PluginRegistry 位于 src/plugin_registry.rs, 提供持久化插件管理。
 
 条目结构:
   RegistryEntry {
-      alias:      String,     // 插件别名 (如 "scanner")
-      path:       String,     // DLL/SO文件路径
-      version:    String,     // 当前版本
-      sha256:     String,     // 文件SHA-256哈希
-      auto_load:  bool,       // 启动时自动加载
-      load_order: i32,        // 加载优先级 (数字越小越先)
-      load_count: u64,        // 历史加载次数
-      last_load:  String,     // 最后加载时间 ISO8601
-      enabled:    bool,       // 是否启用
-      notes:      String,     // 备注
+      path:         String,              // DLL/SO文件路径
+      enabled:      bool,                // 是否启用
+      auto_load:    bool,                // 启动时自动加载
+      load_order:   u32,                 // 加载优先级 (数字越小越先, 默认0)
+      sha256:       String,              // 文件SHA-256哈希
+      version:      String,              // 当前版本 (加载后更新)
+      registered_at: String,             // 首次注册时间 ISO8601
+      last_loaded:  String,              // 最后成功加载时间 ISO8601
+      load_count:   u64,                 // 累计加载次数
+      config:       HashMap<String,String>, // 插件自定义配置
+      categories:   Vec<String>,         // 分类标签
+      description:  String,              // 描述
+      commands:     Vec<String>,         // 声明的命令列表 (加载后填充)
   }
+
+  ⚠ v10.0 修正: 无 alias 字段 (alias 是 HashMap 的 key)
+    无 notes 字段 (用 description 替代)
+    load_order 是 u32 非 i32
+    额外字段: registered_at, config, categories, commands
 
 命令:
   plugin_reg <alias> <path> [auto_load] [load_order]
@@ -1786,24 +1842,137 @@ PluginRegistry 位于 src/plugin_registry.rs, 提供持久化插件管理。
   - SHA-256 文件完整性验证 (加载前检查文件是否被篡改)
   - 注册信息无法被插件直接修改 (只能通过宿主命令/AI)
 
+
+═══════════════════════════════════════════════════════════
+24. 附录E: 子进程执行宿主 plugin_host.rs (v7.0)
+═══════════════════════════════════════════════════════════
+
+plugin_host.rs 实现真正的进程隔离 — 插件在独立子进程中执行,
+任何崩溃 (ACCESS_VIOLATION/SEGFAULT/panic) 仅杀死子进程,
+主进程不受影响。
+
+入口命令:
+  ruoo-console.exe --plugin-exec <dll_path> <command> [--timeout <ms>]
+
+执行流程:
+  1. 标记子进程模式: host_abi::set_subprocess_mode()
+     → 进度/消息函数写stderr转发, 不操作全局状态
+  2. 加载DLL: Library::new(dll_path)
+  3. 读取版本: ruoo_plugin_version() → Option<String>
+  4. 调用init (v2优先):
+     a. 尝试 ruoo_plugin_init(*const HostAPI) — v2指针表签名
+     b. 回退 ruoo_plugin_init() — v1传统无参签名
+  5. 调用exec: ruoo_plugin_exec(cmd_cstr) → *mut c_char
+  6. 调用free_result + shutdown(尽力)
+  7. drop lib
+  8. 输出JSON到stdout → process::exit
+
+输出结构 (PluginHostResult):
+  {
+      "status":     "ok" | "error",
+      "message":    "结果或错误消息",
+      "version":    "1.0.0" | null,
+      "elapsed_ms": 42
+  }
+
+子进程stderr转发协议 (host_abi.rs):
+  插件调用进度/消息宿主函数时, 子进程模式将它们写到stderr:
+    [RPP:create|plugin|id|label|total]
+    [RPP:update|handle|current|msg]
+    [RPP:finish|handle]
+    [RPP:set_total|handle|total]
+    [RMSG:push|plugin|text]
+    [RMSG:tagged|tag|text]
+    [RMSG:update|tag|text]
+    [RMSG:remove|tag]
+
+  父进程读取子进程stderr, 按前缀解析并转发到真实的
+  MultiProgressManager / MessageBroker。
+
+优势:
+  - 任何硬件异常 (ACCESS_VIOLATION等) 不传播到主进程
+  - 野指针/栈溢出/非法指令仅杀死子进程
+  - 父进程通过进程退出码判断成功/失败
+  - 超时由父进程 kill 子进程实现
+
+
+═══════════════════════════════════════════════════════════
+25. 附录F: 宿主ABI v2 (HostAPI指针表 + 双模式)
+═══════════════════════════════════════════════════════════
+
+host_abi.rs 定义 HostAPI 函数指针表和双模式执行。
+
+HostAPI 结构 (repr(C)):
+  HostAPI {
+      version:              u32,       // API版本 (当前=1)
+      progress_create:      fn(plugin, id, label, total) -> *mut c_char,
+      progress_update:      fn(handle, current, msg),
+      progress_finish:      fn(handle),
+      progress_set_total:   fn(handle, total),
+      message_push:         fn(plugin, text),
+      message_tagged:       fn(tag, text),
+      message_update:       fn(tag, text),
+      message_remove:       fn(tag),
+      vault_store:          fn(key, value) -> i32,
+      vault_load:           fn(key) -> *mut c_char,
+      vault_delete:         fn(key) -> i32,
+      vault_list:           fn() -> *mut c_char,
+      interplugin_send:     fn(from, to, msg_type, payload) -> i32,
+      interplugin_broadcast: fn(from, msg_type, payload) -> i32,
+  }
+
+双模式:
+  主进程模式 (TUI):
+    - 函数操作真实的全局状态
+    - progress_* → MultiProgressManager
+    - message_* → MessageBroker
+    - vault_* → 简单KV存储
+
+  子进程模式 (--plugin-exec):
+    - SUBPROCESS_MODE AtomicBool = true
+    - 所有函数静默: 进度/消息写stderr, vault返回空
+    - 父进程通过stderr转发协议解析并更新TUI
+
+插件侧使用 HostAPI:
+  // 在 ruoo_plugin_init 中接收指针表
+  #[no_mangle]
+  pub extern "C" fn ruoo_plugin_init(api: *const HostAPI) -> i32 {
+      if api.is_null() { return -1; }
+      let host = unsafe { &*api };
+      // 保存指针以供后续使用
+      HOST_API.store(api as usize, Ordering::Relaxed);
+      0
+  }
+
+  // 在 exec 中调用宿主函数
+  unsafe {
+      let host = &*(HOST_API.load(Ordering::Relaxed) as *const HostAPI);
+      (host.progress_create)(plugin_cstr, id_cstr, label_cstr, total);
+      (host.message_push)(plugin_cstr, text_cstr);
+  }
+
+
 ═══════════════════════════════════════════════════════════
 结语
 ═══════════════════════════════════════════════════════════
 
-本文档覆盖了 ruoo-arsenal v4.1 插件系统的全部方面:
-  - 9个 C ABI 导出函数 (3必须 + 6可选)
-  - 8个宿主 C ABI 回调 (进度条4 + 消息4 + 保险库3 + 通信2)
+本文档覆盖了 ruoo-console v4.1 插件系统 v10.0 的全部方面:
+  - 9个 C ABI 导出函数 (3必须 + 6可选) + v2 init签名
+  - 14个宿主 C ABI 回调 (进度4 + 消息4 + 保险库4 + 通信2)
   - v8.0 命令注册 (is_ai_tool + ai_params + description)
   - AI工具自动注册 (GLOBAL_AI_TOOLS → OpenAI格式)
   - 完整 Rust/C 模板 (生产级)
-  - 保险库 (AES-256-GCM + 7-pass shred)
-  - 多进度条 (C ABI + 自动清理)
+  - 子进程执行宿主 (plugin_host.rs — 真实进程隔离)
+  - 宿主ABI v2 (HostAPI指针表 + 主/子双模式)
+  - 双层PluginManager架构 (plugin.rs + plugin_mgr.rs)
+  - 保险库 (AES-256-GCM + 7-pass shred + Zstd压缩)
+  - 多进度条 (C ABI + 3s快速清理已完成)
   - 消息代理 (标签/速率限制/结构化日志/事件广播)
-  - 插件间通信总线 (点对点/广播/主题订阅)
-  - 热重载 (命令触发 + 失败回滚 + Windows FreeLibrary)
-  - 熔断器 (CLOSED/OPEN/HALF_OPEN 状态机)
-  - 防崩溃框架 (PluginCallGuard + CrashReport + 三层隔离)
-  - 权限模型 (双层: 插件声明 + 宿主Sandbox)
+  - 插件间通信总线 (publish/drain_for/主题订阅)
+  - 热重载 (命令触发 + 失败回滚 + FreeLibrary)
+  - 熔断器 (CLOSED/OPEN/HALF_OPEN + crash_history + 一次成功恢复)
+  - 防崩溃框架 v6.0 (PluginCallGuard + CrashReport + 四级隔离)
+  - 权限模型 (双层: 插件声明 + 布尔开关SandboxConfig)
   - 注册表 (AES-256-GCM 加密数据库 + 启动自动加载)
 
-所有内容基于源码审计, 无推测。Zero-Day 签。
+Zero-Day 签。
