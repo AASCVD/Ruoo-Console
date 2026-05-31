@@ -945,8 +945,8 @@ fn render_password_screen(frame: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(" ", Style::default().fg(Color::Black).bg(theme::MATRIX_GREEN)),
         ])
     } else {
-        let ch = after.chars().next().unwrap();
-        let remaining = &after[ch.len_utf8()..];
+        let ch = after.chars().next().unwrap_or(' ');
+        let remaining = if ch != ' ' { &after[ch.len_utf8()..] } else { "" };
         Line::from(vec![
             Span::styled("  ", Style::default()),
             Span::styled(before.to_string(), Style::default().fg(theme::MATRIX_GREEN)),
@@ -990,7 +990,21 @@ fn render_right_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
         app.telemetry_cache = Some(crate::telemetry::snapshot());
         app.telemetry_cache_tick = app.tick_count;
     }
-    let tele = app.telemetry_cache.as_ref().unwrap();
+    // v4.1.1: 安全获取遥测缓存, 防止 unwrap panic 导致渲染崩溃
+    let tele = match app.telemetry_cache.as_ref() {
+        Some(t) => t,
+        None => {
+            // 首次渲染还没有缓存, 强制同步获取
+            app.telemetry_cache = Some(crate::telemetry::snapshot());
+            app.telemetry_cache_tick = app.tick_count;
+            // 此时一定有值, 安全 unwrap
+            app.telemetry_cache.as_ref().unwrap_or_else(|| {
+                // 极端情况: telemetry::snapshot() 本身 panic 被捕获后返回默认
+                // 不会到达此处, 但给编译器一个安全路径
+                unreachable!("telemetry_cache 刚刚被填充")
+            })
+        }
+    };
     let p = &tele.proc;
     let border_style = Style::default().fg(theme::CYBER);
 
@@ -1670,8 +1684,9 @@ fn render_input(frame: &mut Frame, app: &mut App, rect: Rect) {
         let (cursor_span, remaining_after): (Span, &str) = if after.is_empty() {
             (Span::styled(" ", Style::default().fg(Color::Black).bg(theme::DANGER)), "")
         } else {
-            let ch = after.chars().next().unwrap();
-            (Span::styled(ch.to_string(), Style::default().fg(Color::Black).bg(theme::DANGER)), &after[ch.len_utf8()..])
+            let ch = after.chars().next().unwrap_or(' ');
+            let rem = if ch != ' ' { &after[ch.len_utf8()..] } else { "" };
+            (Span::styled(ch.to_string(), Style::default().fg(Color::Black).bg(theme::DANGER)), rem)
         };
 
         let prompt_text = app.password_prompt.clone();
@@ -1709,8 +1724,9 @@ fn render_input(frame: &mut Frame, app: &mut App, rect: Rect) {
         let (cursor_span, remaining_after): (Span, &str) = if after.is_empty() {
             (Span::styled(" ", Style::default().fg(Color::Black).bg(theme::WARN)), "")
         } else {
-            let ch = after.chars().next().unwrap();
-            (Span::styled(ch.to_string(), Style::default().fg(Color::Black).bg(theme::WARN)), &after[ch.len_utf8()..])
+            let ch = after.chars().next().unwrap_or(' ');
+            let rem = if ch != ' ' { &after[ch.len_utf8()..] } else { "" };
+            (Span::styled(ch.to_string(), Style::default().fg(Color::Black).bg(theme::WARN)), rem)
         };
 
         let cursor_char = after.chars().next().map(|c| c.to_string()).unwrap_or_default();
@@ -1796,8 +1812,8 @@ fn render_input(frame: &mut Frame, app: &mut App, rect: Rect) {
                 "",
             )
         } else {
-            let ch = after.chars().next().unwrap();
-            let remaining = &after[ch.len_utf8()..];
+            let ch = after.chars().next().unwrap_or(' ');
+            let remaining = if ch != ' ' { &after[ch.len_utf8()..] } else { "" };
             (
                 Span::styled(ch.to_string(), Style::default().fg(cursor_fg).bg(cursor_bg)),
                 remaining,

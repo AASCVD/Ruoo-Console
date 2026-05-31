@@ -884,6 +884,7 @@ pub mod native_crash {
 /// 如果 stdin::thread::lifecycle.rs:243 的 "threads should not terminate unexpectedly"
 /// 仍然触发 (如 STACK_OVERFLOW → ExitThread → Rust检测), 在此截获并记录,
 /// 防止进程 abort.
+/// v4.1.1: 所有 panic 路径添加终端恢复, 防止 raw mode + 替代屏幕卡死
 pub fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -922,6 +923,16 @@ pub fn install_panic_hook() {
             }
             // 不调用 default_hook — 进程继续运行
             return;
+        }
+
+        // ★ v4.1.1: 非 lifecycle panic — 先恢复终端再走默认处理
+        {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::cursor::Show,
+                crossterm::terminal::LeaveAlternateScreen
+            );
         }
 
         // 其他 panic: 走默认处理

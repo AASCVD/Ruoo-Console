@@ -88,6 +88,7 @@ fn is_running_as_admin() -> bool {
 // ═══════════════════════════════════════════════════
 
 /// 安装全局 panic hook — 将崩溃信息写入 ruoo_crash.log
+/// v4.1.1: 恢复终端状态后再调用 default_hook, 防止 panic 后终端卡死
 fn install_crash_defense() {
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
@@ -106,6 +107,13 @@ fn install_crash_defense() {
 
         let crash_msg = format!("[CRASH {}] {} | {}", ts, loc, payload);
         eprintln!("{}", crash_msg);
+
+        // ★ v4.1.1: panic 发生后立即恢复终端 — 防止 raw mode + 替代屏幕卡死
+        {
+            use crossterm::execute;
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = execute!(std::io::stdout(), crossterm::cursor::Show, crossterm::terminal::LeaveAlternateScreen);
+        }
 
         // 崩溃日志 → 工作目录/log/ruoo_crash.log
         {
@@ -1307,7 +1315,7 @@ fn auto_load_plugins(app: &mut App) {
         app.push_output(&format!("  [·] 加载: {} ({})...", plugin_name, path_str));
 
         let load_result = {
-            let mut mgr = app.plugin_mgr.lock().unwrap();
+            let mut mgr = app.plugin_mgr.lock().unwrap_or_else(|e| e.into_inner());
             mgr.load(plugin_name, &path_str)
         }; // MutexGuard在此释放
 
@@ -1380,10 +1388,10 @@ fn do_login(app: &mut App, password: &str) {
                     app.push_output("[+] 插件注册表已挂载");
 
                     // 自动加载注册表中的插件 (含命令注册)
-                    app.plugin_mgr.lock().unwrap().set_plugin_registry(reg_arc);
+                    app.plugin_mgr.lock().unwrap_or_else(|e| e.into_inner()).set_plugin_registry(reg_arc);
         // v8.0: 设置全局 PluginManager 供 AI 统一命令池调度
         // v9.0: 全局 PluginManager 已在 init_global_plugin_manager() 初始化
-                    let load_results = app.plugin_mgr.lock().unwrap().auto_load_from_registry(&mut app.cmd_registry);
+                    let load_results = app.plugin_mgr.lock().unwrap_or_else(|e| e.into_inner()).auto_load_from_registry(&mut app.cmd_registry);
                     for msg in load_results {
                         app.push_output(&msg);
                     }
@@ -1437,7 +1445,7 @@ fn do_create_vault(app: &mut App, password: &str) -> Result<(), String> {
             app.plugin_registry = Some(reg_arc.clone());
             crate::ai::set_global_plugin_registry(reg_arc.clone());
             app.push_output("[+] 插件注册表已创建");
-            app.plugin_mgr.lock().unwrap().set_plugin_registry(reg_arc);
+            app.plugin_mgr.lock().unwrap_or_else(|e| e.into_inner()).set_plugin_registry(reg_arc);
         // v8.0: 设置全局 PluginManager 供 AI 统一命令池调度
         // v9.0: 全局 PluginManager 已在 init_global_plugin_manager() 初始化
             app.push_output("[*] 使用 plugin_reg 注册插件到加密数据库");
@@ -1767,16 +1775,12 @@ fn main() -> io::Result<()> {
     }
 
     // ═══ 防崩溃系统 — 必须在任何操作之前安装 ═══
+    // v4.1.1: 安装顺序 — panic hook 优先(含终端恢复+lifecycle截获), VEH 其次
     install_crash_defense();
+    // v4.6: 防御性 panic hook — 合并 lifecycle.rs:243 特殊处理 + 终端恢复
+    panic_guard::install_panic_hook();
     // v6.0: 安装 Windows VEH 原生崩溃捕获 — 防止插件 ACCESS_VIOLATION 杀死进程
     panic_guard::native_crash::install();
-    // v4.6: 防御性 panic hook (处理 lifecycle.rs:243 等)
-    panic_guard::install_panic_hook();
-
-    // v4.3: 安装 Windows 原生崩溃捕获 (VEH — 捕获插件 DLL 的 SEGV/访问违规)
-    crate::panic_guard::native_crash::install();
-    // v4.6: 安装全局 panic hook 作为最后防线 (lifecycle.rs panic 截获)
-    crate::panic_guard::install_panic_hook();
 
     // Windows: 设置控制台为 UTF-8，解决中文乱码
     #[cfg(windows)]
@@ -2256,7 +2260,7 @@ fn main() -> io::Result<()> {
                         app.push_output("[!] 操作: 自动强制卸载");
                         // 尝试force_unload — 在独立作用域中操作，确保MutexGuard释放
                         let unload_result = {
-                            let mut mgr = app.plugin_mgr.lock().unwrap();
+                            let mut mgr = app.plugin_mgr.lock().unwrap_or_else(|e| e.into_inner());
                             mgr.force_unload(&plugin_name)
                         };
                         match unload_result {
