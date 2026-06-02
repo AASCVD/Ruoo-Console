@@ -239,27 +239,111 @@ fn walk_size(path: &Path) -> (usize, usize, u64) {
 
 // ═══ 文件读写 ═══
 
+/// 最大读取文件大小: 5MB — 超过此大小拒绝全量读取, 防止 OOM/终端崩溃
+pub const MAX_READ_SIZE: u64 = 5 * 1024 * 1024;
+
+/// 最大返回输出大小: 100KB — AI 工具返回值超过此大小自动截断
+pub const MAX_OUTPUT_SIZE: usize = 100 * 1024;
+
 pub fn read_file(path: &str) -> Result<String, String> {
     let p = resolve(path);
+    let meta = fs::metadata(&p).map_err(|e| format!("无法获取文件信息: {}", e))?;
+    let size = meta.len();
+    if size > MAX_READ_SIZE {
+        return Err(format!(
+            "文件过大 ({}), 拒绝全量读取以防止终端崩溃。\n\
+             请使用以下工具:\n  read_file_lines — 读取指定行范围\n  head_file    — 读取开头N行\n  \
+             tail_file    — 读取末尾N行\n  range_read   — 按字节偏移读取\n  \
+             stream_grep  — 流式搜索\n  count_lines  — 统计行数\n  \
+             stream_file_info — 流式统计文件信息",
+            format_bytes(size)
+        ));
+    }
     fs::read_to_string(&p).map_err(|e| format!("读取失败: {}", e))
 }
+
+/// 流式读取最大行数: 10万行 — 防止 collect() 撑爆内存
+pub const MAX_READ_LINES: usize = 100_000;
 
 pub fn read_file_lines(path: &str, start: usize, end: Option<usize>) -> Result<String, String> {
     let p = resolve(path);
     let file = fs::File::open(&p).map_err(|e| format!("打开失败: {}", e))?;
     let reader = BufReader::new(file);
-    let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
-    let end = end.unwrap_or(lines.len()).min(lines.len());
-    if start > end || start > lines.len() {
-        return Err(format!("行号无效: {}-{} (共{}行)", start, end, lines.len()));
+
+    // 流式读取: 只保留 start..end 范围内的行, 超过 end 立即停止
+    let range_end = end.map(|e| e.max(start)).unwrap_or(start);
+    let max_to_keep = (range_end - start + 1).min(MAX_READ_LINES);
+
+    let mut kept: Vec<String> = Vec::with_capacity(max_to_keep);
+    let mut total_lines: usize = 0;
+
+    for line_result in reader.lines() {
+        let line = line_result.map_err(|e| format!("读取行失败: {}", e))?;
+        total_lines += 1;
+        if total_lines > MAX_READ_LINES && kept.is_empty() {
+            return Err(format!(
+                "文件过大 (超过{}行), 拒绝全量扫描。\n\
+                 请使用: head_file/tail_file 看头尾, stream_grep 搜索, \
+                 build_line_index+seek_line 索引定位",
+                MAX_READ_LINES
+            ));
+        }
+        // 在目标范围内才保留
+        if total_lines >= start && (end.is_none() || total_lines <= end.unwrap()) {
+            if kept.len() < max_to_keep {
+                kept.push(line);
+            } else {
+                break; // 超出需要的行数, 停止
+            }
+        }
+        // 超过 end 且没有 end=None (读到底) 的情况 — 超过 end 就停
+        if let Some(e) = end {
+            if total_lines > e {
+                break;
+            }
+        }
     }
-    Ok(lines[start.saturating_sub(1)..end].join("\n"))
+
+    if start > total_lines {
+        return Err(format!("行号无效: 起始行 {} > 文件总行数 {}", start, total_lines));
+    }
+
+    Ok(kept.join("\n"))
 }
+/// Windows 文本文件 CRLF 转换: .bat/.cmd/.ps1/.reg/.vbs/.wsf 等必须用 CRLF
+/// 仅在 #[cfg(windows)] 时生效, 其他平台原样返回
+fn maybe_crlf(path: &Path, content: &str) -> String {
+    #[cfg(windows)]
+    {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+        let crlf_exts = ["bat", "cmd", "ps1", "reg", "vbs", "wsf", "inf", "sysprep"];
+        if crlf_exts.contains(&ext.as_str()) && content.contains('\n') {
+            // 将独立的 LF 转为 CRLF (跳过已有的 CRLF)
+            let mut result = String::with_capacity(content.len() + content.len() / 70);
+            let mut prev = '\0';
+            for ch in content.chars() {
+                if ch == '\n' && prev != '\r' {
+                    result.push('\r');
+                }
+                result.push(ch);
+                prev = ch;
+            }
+            return result;
+        }
+    }
+    let _ = path; // Linux/macOS: 原样返回
+    content.to_string()
+}
+
 
 pub fn write_file(path: &str, content: &str) -> Result<String, String> {
     let p = resolve(path);
-    fs::write(&p, content).map_err(|e| format!("写入失败: {}", e))?;
-    Ok(format!("已写入: {} ({} 字节)", p.display(), content.len()))
+    let data = maybe_crlf(&p, content);
+    fs::write(&p, &data).map_err(|e| format!("写入失败: {}", e))?;
+    Ok(format!("已写入: {} ({} 字节)", p.display(), data.len()))
 }
 
 pub fn append_file(path: &str, content: &str) -> Result<String, String> {
@@ -275,7 +359,10 @@ pub fn create_file(path: &str, content: Option<&str>) -> Result<String, String> 
     if p.exists() { return Err(format!("文件已存在: {}", p.display())); }
     if let Some(parent) = p.parent() { fs::create_dir_all(parent).ok(); }
     match content {
-        Some(c) => { fs::write(&p, c).map_err(|e| format!("创建失败: {}", e))?; }
+        Some(c) => {
+            let data = maybe_crlf(&p, c);
+            fs::write(&p, &data).map_err(|e| format!("创建失败: {}", e))?;
+        }
         None => { fs::File::create(&p).map_err(|e| format!("创建失败: {}", e))?; }
     }
     Ok(format!("已创建: {}", p.display()))
@@ -311,8 +398,15 @@ pub fn stat(path: &str) -> Result<String, String> {
         p.display(), metadata.len(), format_bytes(metadata.len()), mtime, metadata.permissions().readonly()))
 }
 
+/// 哈希最大文件大小: 500MB — 超过此大小使用流式哈希
+pub const MAX_HASH_SIZE: u64 = 500 * 1024 * 1024;
+
 pub fn hash_file(path: &str, algo: &str) -> Result<String, String> {
     let p = resolve(path);
+    let meta = fs::metadata(&p).map_err(|e| format!("无法获取文件信息: {}", e))?;
+    if meta.len() > MAX_HASH_SIZE {
+        return Err(format!("文件过大 ({}), 拒绝全量哈希。请使用外部工具 sha256sum", format_bytes(meta.len())));
+    }
     let data = fs::read(&p).map_err(|e| format!("读取失败: {}", e))?;
     use sha2::Digest;
     let hash = match algo.to_lowercase().as_str() {
@@ -370,14 +464,17 @@ fn simple_match(name: &str, pattern: &str) -> bool {
 
 pub fn grep(pattern: &str, path: &str, case_insensitive: bool, max: usize) -> Result<Vec<String>, String> {
     let p = resolve(path);
-    let content = fs::read_to_string(&p).map_err(|e| format!("读取失败: {}", e))?;
+    let file = fs::File::open(&p).map_err(|e| format!("打开失败: {}", e))?;
+    let reader = BufReader::new(file);
     let mut results = Vec::new();
     let pl = if case_insensitive { pattern.to_lowercase() } else { pattern.to_string() };
-    for (i, line) in content.lines().enumerate() {
-        let cl = if case_insensitive { line.to_lowercase() } else { line.to_string() };
+    let max = max.max(1);
+    for (i, line_result) in reader.lines().enumerate() {
+        let line = line_result.map_err(|e| format!("读取行失败: {}", e))?;
+        let cl = if case_insensitive { line.to_lowercase() } else { line.clone() };
         if cl.contains(&pl) {
-            results.push(format!("{}:{}: {}", i + 1, line, line.trim()));
-            if results.len() >= max.max(1) { break; }
+            results.push(format!("{}: {}", i + 1, line.trim_end()));
+            if results.len() >= max { break; }
         }
     }
     Ok(results)
@@ -385,6 +482,10 @@ pub fn grep(pattern: &str, path: &str, case_insensitive: bool, max: usize) -> Re
 
 pub fn find_replace(path: &str, find: &str, replace: &str, regex_mode: bool, case_insensitive: bool) -> Result<String, String> {
     let p = resolve(path);
+    let meta = fs::metadata(&p).map_err(|e| format!("无法获取文件信息: {}", e))?;
+    if meta.len() > MAX_READ_SIZE {
+        return Err(format!("文件过大 ({}), 请使用 stream_find_replace 流式替换", format_bytes(meta.len())));
+    }
     let content = fs::read_to_string(&p).map_err(|e| format!("读取失败: {}", e))?;
     let (new_content, count) = if regex_mode {
         let re = regex::Regex::new(find).map_err(|e| format!("正则错误: {}", e))?;
@@ -407,6 +508,10 @@ pub fn find_replace(path: &str, find: &str, replace: &str, regex_mode: bool, cas
 
 pub fn dedup(path: &str, ignore_case: bool) -> Result<String, String> {
     let p = resolve(path);
+    let meta = fs::metadata(&p).map_err(|e| format!("无法获取文件信息: {}", e))?;
+    if meta.len() > MAX_READ_SIZE {
+        return Err(format!("文件过大 ({}), 拒绝去重以防止OOM", format_bytes(meta.len())));
+    }
     let content = fs::read_to_string(&p).map_err(|e| format!("读取失败: {}", e))?;
     let lines: Vec<&str> = content.lines().collect();
     let mut seen = std::collections::HashSet::new();
@@ -423,6 +528,10 @@ pub fn dedup(path: &str, ignore_case: bool) -> Result<String, String> {
 
 pub fn sort_lines(path: &str, reverse: bool, numeric: bool, unique: bool) -> Result<String, String> {
     let p = resolve(path);
+    let meta = fs::metadata(&p).map_err(|e| format!("无法获取文件信息: {}", e))?;
+    if meta.len() > MAX_READ_SIZE {
+        return Err(format!("文件过大 ({}), 拒绝排序以防止OOM", format_bytes(meta.len())));
+    }
     let content = fs::read_to_string(&p).map_err(|e| format!("读取失败: {}", e))?;
     let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
     if numeric {
@@ -446,6 +555,10 @@ pub fn sort_lines(path: &str, reverse: bool, numeric: bool, unique: bool) -> Res
 
 pub fn word_count(path: &str, top_n: usize, ignore_case: bool, min_len: usize) -> Result<String, String> {
     let p = resolve(path);
+    let meta = fs::metadata(&p).map_err(|e| format!("无法获取文件信息: {}", e))?;
+    if meta.len() > MAX_READ_SIZE {
+        return Err(format!("文件过大 ({}), 拒绝词频统计以防止OOM", format_bytes(meta.len())));
+    }
     let content = fs::read_to_string(&p).map_err(|e| format!("读取失败: {}", e))?;
     let mut freq = std::collections::HashMap::new();
     for word in content.split(|c: char| !c.is_alphanumeric()) {
@@ -461,6 +574,10 @@ pub fn word_count(path: &str, top_n: usize, ignore_case: bool, min_len: usize) -
 
 pub fn text_stats(path: &str) -> Result<String, String> {
     let p = resolve(path);
+    let meta = fs::metadata(&p).map_err(|e| format!("无法获取文件信息: {}", e))?;
+    if meta.len() > MAX_READ_SIZE {
+        return Err(format!("文件过大 ({}), 请使用 stream_file_info 流式统计", format_bytes(meta.len())));
+    }
     let content = fs::read_to_string(&p).map_err(|e| format!("读取失败: {}", e))?;
     let chars = content.chars().count(); let bytes = content.len(); let lines = content.lines().count();
     let words = content.split_whitespace().count();
@@ -469,6 +586,10 @@ pub fn text_stats(path: &str) -> Result<String, String> {
 
 pub fn split_file(path: &str, chunk_size_mb: usize) -> Result<String, String> {
     let p = resolve(path);
+    let meta = fs::metadata(&p).map_err(|e| format!("无法获取文件信息: {}", e))?;
+    if meta.len() > MAX_HASH_SIZE {
+        return Err(format!("文件过大 ({}), 拒绝全量读取分割。请使用外部工具 split", format_bytes(meta.len())));
+    }
     let data = fs::read(&p).map_err(|e| format!("读取失败: {}", e))?;
     let chunk_size = (chunk_size_mb.max(1) * 1024 * 1024).min(data.len());
     let _total = data.len(); let mut chunks = 0usize;

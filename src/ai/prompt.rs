@@ -71,7 +71,7 @@ const DEFAULT_SYSTEM_PROMPT: &str = r#"你是 RUOO-CONSOLE 的内置 AI 助手 "
 - 插件编写请遵守：工具编写
 
 ## ⚠ 文件操作铁律 (违反即灾难!)
-- read_file — 读取整个文件内容。大文件先用 read_file_lines 看头尾
+- read_file — 读取整个文件内容。⚠ 超过5MB(≈10万行)会拒绝！大文件必须用流式工具
 - read_file_lines — 读取指定行范围。查看大文件首选
 - grep — 在文件中搜索匹配行。查找函数/变量/模式
 - find_replace_in_file — ✅ 修改文件的唯一正确工具！只替换匹配文本，文件其余部分不变
@@ -178,7 +178,7 @@ pub fn build_tools() -> Vec<Value> {
         t0!("pwd", "获取当前工作目录的绝对路径"),
         t1!("cd", "切换当前工作目录到指定路径", "path", "string", "目标目录路径"),
         t1!("ls", "列出目录内容 — 返回文件/目录名、大小、修改时间", "path", "string", "目录路径(可选,默认当前目录)"),
-        t1!("read_file", "读取文件全部内容 — 返回完整文本。用于查看文件内容(代码/配置/日志)", "path", "string", "文件路径"),
+        t1!("read_file", "读取文件全部内容 — ⚠ 5MB硬限制! 超大文件请用read_file_lines/stream_grep/range_read避免OOM", "path", "string", "文件路径"),
         t2!("read_file_lines", "读取文件指定行范围 — 从start行到end行(含)。大文件先用此工具看头尾，不要read_file整个大文件", "path", "string", "文件路径", "start", "integer", "起始行号(从1开始,含)"),
         t2!("write_file", "⚠【覆盖写入整个文件】— 会用content完全替换文件的全部内容！文件不存在则创建。要修改文件中的部分内容请用find_replace_in_file，不要用此工具！创建新文件请用create_file", "path", "string", "文件路径", "content", "string", "文件的完整新内容(会替换整个文件!)"),
         t2!("append_file", "向文件末尾追加文本 — 不修改已有内容，只在文件尾部添加新行", "path", "string", "文件路径", "content", "string", "要追加到文件末尾的文本"),

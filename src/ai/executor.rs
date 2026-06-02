@@ -2136,6 +2136,9 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
     } else { result.clone() };
     crate::telemetry::push_tool_result(name, success, duration_ms, &short_result);
 
+    // ★ 输出截断: 防止工具返回超大结果撑爆终端 (100KB硬限制)
+    let result = truncate_tool_output(result);
+
     // ★ 路径穿越警告统一收取 — 防止 println! 破坏 TUI 界面
     let warnings = crate::tools::files::drain_path_warnings();
     if warnings.is_empty() {
@@ -2143,6 +2146,24 @@ pub(crate) fn execute_tool(name: &str, args_json: &str) -> String {
     } else {
         format!("{}\n{}", warnings.join("\n"), result)
     }
+}
+
+/// 截断工具输出以防止终端OOM — 保留前100KB
+fn truncate_tool_output(s: String) -> String {
+    const MAX: usize = 100 * 1024; // 100KB
+    if s.len() <= MAX {
+        return s;
+    }
+    let truncate_at = s.floor_char_boundary(MAX.saturating_sub(80));
+    format!(
+        "{}\n\n[!] ═══ 输出已截断 ═══\n\
+         [!] 原始{}字节, 超出限制{}字节\n\
+         [*] 请使用: head_file/tail_file 看头尾, stream_grep 搜索, \
+         range_read/read_file_lines 精准读取",
+        &s[..truncate_at],
+        s.len(),
+        s.len().saturating_sub(MAX)
+    )
 }
 
 // ═══ exec_bg 辅助函数 ═══

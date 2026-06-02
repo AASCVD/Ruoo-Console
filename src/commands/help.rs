@@ -76,7 +76,7 @@ fn flush_leaf_with_width(
 /// 内部: 格式化单个分类的插件命令输出到 out (使用统一 col_width)
 fn format_plugin_category_with_width(
     cat_name: &str,
-    cmds: &[&PluginCommandDef],
+    cmds: &[PluginCommandDef],
     out: &mut Vec<String>,
     col_width: usize,
 ) {
@@ -96,7 +96,7 @@ fn format_plugin_category_with_width(
         if let Some((_, g)) = groups.iter_mut().find(|(b, _)| *b == base) {
             g.push(cmd);
         } else {
-            groups.push((base, vec![*cmd]));
+            groups.push((base, vec![cmd]));
         }
     }
 
@@ -156,10 +156,14 @@ pub fn help_text_filtered(app: &crate::App, category: Option<&str>) -> Vec<Strin
         }
     }
 
-    // 插件命令: 按 category 字段分组
-    let mut plugin_cats: Vec<(String, Vec<&PluginCommandDef>)> = Vec::new();
+    // 插件命令: 按 category 字段分组 (v10.3: 同时从 app.cmd_registry 和 GLOBAL_CMD_REGISTRY 读取)
+    let mut plugin_cats: Vec<(String, Vec<PluginCommandDef>)> = Vec::new();
+    let mut seen_cmds: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 从 app.cmd_registry 读取
     for def in app.cmd_registry.list_all().into_iter() {
         if def.is_builtin { continue; }
+        if !seen_cmds.insert(def.cmd.clone()) { continue; } // 去重
         if let Some(filter) = category {
             let fl = filter.to_lowercase();
             let cat_name = if def.category.is_empty() { &def.plugin_name } else { &def.category };
@@ -174,9 +178,35 @@ pub fn help_text_filtered(app: &crate::App, category: Option<&str>) -> Vec<Strin
             format!("[插件] {}", def.category)
         };
         if let Some((_, items)) = plugin_cats.iter_mut().find(|(c, _)| *c == cat_name) {
-            items.push(def);
+            items.push(def.clone());
         } else {
-            plugin_cats.push((cat_name, vec![def]));
+            plugin_cats.push((cat_name, vec![def.clone()]));
+        }
+    }
+
+    // v10.3: 从 GLOBAL_CMD_REGISTRY 读取 (AI 加载的插件命令)
+    if let Some(global_reg) = crate::ai::with_global_cmd_registry(|reg| reg.list_all().into_iter().map(|d| d.clone()).collect::<Vec<_>>()) {
+        for def in &global_reg {
+            if def.is_builtin { continue; }
+            if !seen_cmds.insert(def.cmd.clone()) { continue; } // 去重
+            if let Some(filter) = category {
+                let fl = filter.to_lowercase();
+                let cat_name = if def.category.is_empty() { &def.plugin_name } else { &def.category };
+                let matched = cat_name.to_lowercase().contains(&fl)
+                    || def.cmd.to_lowercase().contains(&fl)
+                    || def.help.to_lowercase().contains(&fl);
+                if !matched { continue; }
+            }
+            let cat_name = if def.category.is_empty() {
+                format!("[插件] {}", def.plugin_name)
+            } else {
+                format!("[插件] {}", def.category)
+            };
+            if let Some((_, items)) = plugin_cats.iter_mut().find(|(c, _)| *c == cat_name) {
+                items.push(def.clone());
+            } else {
+                plugin_cats.push((cat_name, vec![def.clone()]));
+            }
         }
     }
 
@@ -270,8 +300,11 @@ fn gather_all_categories(app: &crate::App) -> Vec<(String, usize)> {
         }
     }
 
+    // v10.3: 同时从 app.cmd_registry 和 GLOBAL_CMD_REGISTRY 收集插件分类
+    let mut seen_cmds: std::collections::HashSet<String> = std::collections::HashSet::new();
     for def in app.cmd_registry.list_all().into_iter() {
         if def.is_builtin { continue; }
+        if !seen_cmds.insert(def.cmd.clone()) { continue; }
         let cat_name = if def.category.is_empty() {
             format!("[插件] {}", def.plugin_name)
         } else {
@@ -281,6 +314,22 @@ fn gather_all_categories(app: &crate::App) -> Vec<(String, usize)> {
             *count += 1;
         } else {
             result.push((cat_name, 1));
+        }
+    }
+    if let Some(global_defs) = crate::ai::with_global_cmd_registry(|reg| reg.list_all().into_iter().map(|d| d.clone()).collect::<Vec<_>>()) {
+        for def in &global_defs {
+            if def.is_builtin { continue; }
+            if !seen_cmds.insert(def.cmd.clone()) { continue; }
+            let cat_name = if def.category.is_empty() {
+                format!("[插件] {}", def.plugin_name)
+            } else {
+                format!("[插件] {}", def.category)
+            };
+            if let Some((_, count)) = result.iter_mut().find(|(c, _)| *c == cat_name) {
+                *count += 1;
+            } else {
+                result.push((cat_name, 1));
+            }
         }
     }
 

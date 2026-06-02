@@ -195,8 +195,6 @@ pub fn process_cmd(app: &mut App, raw: &str) {
                 full
             };
 
-            app.push_output(&format!("[plugin:{}] {} → {}", plugin_name, def.cmd, plugin_cmd));
-
             // v7.2: 异步调用 — 不阻塞UI线程, 后台执行子进程
             let mgr_clone = app.plugin_mgr.clone();
             let pn = plugin_name.clone();
@@ -212,7 +210,7 @@ pub fn process_cmd(app: &mut App, raw: &str) {
                     Ok(result) => {
                         let mut lines = result.lines();
                         if let Some(first) = lines.next() {
-                            out.push(format!("[plugin:{}] {}", pn, first));
+                            out.push(first.to_string());
                         }
                         for line in lines {
                             out.push(line.to_string());

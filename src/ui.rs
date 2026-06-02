@@ -457,9 +457,8 @@ pub fn ui(frame: &mut Frame, app: &mut App) {
             Span::styled("", Style::default())
         };
         let status = Line::from(vec![
-            Span::styled("ARSENAL", Style::default().fg(theme::MUTED)),
+            Span::styled("RUOO-CONSOLE", Style::default().fg(theme::MUTED)),
             Span::styled("|Zero-Day", Style::default().fg(theme::DANGER)),
-            Span::styled(format!("|行:{}", app.output.len()), Style::default().fg(theme::MUTED)),
             Span::styled(scroll_info, Style::default().fg(theme::WARN)),
             ai_status,
         ]);
@@ -1151,8 +1150,23 @@ fn render_right_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             );
 
             // ═══ 下半: 活动面板 ═══
-            // v14.1: 始终平分 — 避免内容出现/消失时布局突变导致面板跳动
-            let act_split = [Constraint::Percentage(50), Constraint::Percentage(50)];
+            // v14.2: 动态分配高度 — 工具调用按内容行数取空间(上限限制),
+            // 网络收发拿剩余空间。避免固定50/50导致的溢出/空行问题。
+            let max_tool_entries = 10usize;
+            let tool_content_lines: u16 = {
+                let mut count = 1u16; // 统计头行 (总是存在)
+                if has_tools {
+                    count += tool_events.len().min(max_tool_entries) as u16;
+                } else {
+                    count += 1; // "无活动" 占位行
+                }
+                if has_ai { count += 1; } // AI 状态行
+                count
+            };
+            let act_h = parts[1].height;
+            // 工具面板: 内容行+2边框, 至少保留4行给网络(2边框+2内容最小)
+            let tool_h = (tool_content_lines + 2).min(act_h.saturating_sub(4)).max(4);
+            let act_split = [Constraint::Length(tool_h), Constraint::Min(4)];
             let act_parts = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints(act_split)
@@ -1171,7 +1185,7 @@ fn render_right_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
 
                 let avail_tool_rows = act_parts[0].height.saturating_sub(2) as usize;
                 if has_tools && avail_tool_rows > 1 {
-                    let max_display = avail_tool_rows.min(10);
+                    let max_display = avail_tool_rows.min(max_tool_entries);
                     let recent_tools: Vec<&crate::telemetry::ToolEvent> = tool_events.iter().rev().take(max_display).collect();
                     for ev in recent_tools.iter().rev() {
                         let elapsed = ev.timestamp.elapsed().as_secs();
@@ -1328,11 +1342,6 @@ fn render_right_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
 
                 if act_parts[1].height > 12 {
                     net_lines.push(Line::from(Span::styled("\u{2500}\u{2500} \u{4f1a}\u{8bdd} \u{2500}\u{2500}", Style::default().fg(theme::CYBER))));
-                    net_lines.push(Line::from(vec![
-                        Span::styled("Tgt ", Style::default().fg(theme::MUTED)),
-                        Span::styled(if app.target.is_empty() { "(\u{672a}\u{8bbe})" } else { &app.target },
-                            Style::default().fg(if app.target.is_empty() { theme::MUTED } else { theme::WARN })),
-                    ]));
                     net_lines.push(Line::from(vec![
                         Span::styled("Out ", Style::default().fg(theme::MUTED)),
                         Span::styled(format!("{}\u{884c}", app.output.len()), Style::default().fg(theme::ACCENT)),

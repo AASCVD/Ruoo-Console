@@ -609,9 +609,10 @@ impl CommandRegistry {
     }
 
     pub fn register_plugin(&mut self, plugin_name: &str, cmds: &[PluginCommandDef]) -> Result<usize, String> {
-        // 检查命令名冲突
+        // v10.3: 命令名规范化为小写, 大小写不敏感冲突检测
         for cmd in cmds {
-            if let Some(existing) = self.commands.get(&cmd.cmd) {
+            let lower_cmd = cmd.cmd.to_lowercase();
+            if let Some(existing) = self.commands.get(&lower_cmd) {
                 return Err(format!(
                     "命令名冲突: '{}' 已被插件 '{}' 注册",
                     cmd.cmd, existing.plugin_name
@@ -625,13 +626,21 @@ impl CommandRegistry {
             let mut def = cmd.clone();
             def.plugin_name = plugin_name.to_string();
             def.is_builtin = false;
+            // v10.3: 规范化为小写存储, 与 process_cmd 的 lowercase 输入一致
+            def.cmd = def.cmd.to_lowercase();
 
-            // 注册别名映射
+            // 注册别名映射 (别名也规范化为小写)
+            let mut lower_aliases: Vec<String> = Vec::new();
             for alias in &def.aliases {
-                if self.aliases.contains_key(alias) {
+                let la = alias.to_lowercase();
+                if self.aliases.contains_key(&la) {
                     return Err(format!("别名冲突: '{}' 已被占用", alias));
                 }
-                self.aliases.insert(alias.clone(), def.cmd.clone());
+                lower_aliases.push(la);
+            }
+            def.aliases = lower_aliases.clone();
+            for la in &lower_aliases {
+                self.aliases.insert(la.clone(), def.cmd.clone());
             }
 
             cmd_names.push(def.cmd.clone());
@@ -658,8 +667,24 @@ impl CommandRegistry {
     }
 
     pub fn find(&self, input: &str) -> Option<&PluginCommandDef> {
-        self.commands.get(input)
-            .or_else(|| self.aliases.get(input).and_then(|cmd| self.commands.get(cmd)))
+        // v10.3: 大小写不敏感查找 — process_cmd 会将输入转为小写再查找
+        // 先尝试精确匹配, 再尝试小写匹配 (兼容历史数据)
+        if let Some(def) = self.commands.get(input) {
+            return Some(def);
+        }
+        let lower = input.to_lowercase();
+        if lower != input {
+            if let Some(def) = self.commands.get(&lower) {
+                return Some(def);
+            }
+        }
+        // 别名查找 (同样支持大小写不敏感)
+        if let Some(cmd) = self.aliases.get(input)
+            .or_else(|| self.aliases.get(&lower))
+        {
+            return self.commands.get(cmd);
+        }
+        None
     }
 
     pub fn list_all(&self) -> Vec<&PluginCommandDef> {
