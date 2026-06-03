@@ -741,6 +741,30 @@ pub fn process_cmd(app: &mut App, raw: &str) {
             } else { app.push_output("[!] 用法: exec_send <PID> <输入文本>"); }
         }
         _ => {
+            // v10.5: 降级路由 — 命令未注册但可能匹配已加载插件名
+            let plugin_loaded = {
+                let mgr = app.plugin_mgr.lock().unwrap_or_else(|e| e.into_inner());
+                mgr.is_loaded(&cmd)
+            };
+            if plugin_loaded {
+                // 重新探测命令并注册, 然后重试路由
+                let mgr = app.plugin_mgr.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(info) = mgr.get_info(&cmd) {
+                    let dll_path = info.path.to_string_lossy().to_string();
+                    drop(mgr);
+                    match crate::plugin::try_register_from_file(&dll_path, &cmd, &mut app.cmd_registry) {
+                        Ok(n) if n > 0 => {
+                            app.push_output(&format!("[+] 自动注册 {} 个命令 (插件: {})", n, cmd));
+                            // 递归调用 — 现在命令已在注册表中
+                            process_cmd(app, raw);
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(e) => app.push_output(&format!("[*] 命令探测: {}", e)),
+                    }
+                }
+            }
+
             // v7.1: 未匹配命令 → 自动转发到 AI (若已激活)
             if app.ai_mode && app.ai_session.is_some() && !app.ai_pending {
                 let ai_query = format!("&{}", raw.trim());
